@@ -23,9 +23,12 @@ database_id = "6a01f49c-db70-40f3-b1e6-db4a3d9afd55"
 binding = "ASSIST_KV"
 id = "f44739ac9544450da6f1b585fdd51fdf"
 
-# 定时任务：每小时跑一轮，每轮只同步一个账号（轮转，见 cron.ts 的 sync_cursor）。
-# ⚠️ 不能写成「整包同步所有账号」——每域名一次 listDnsRecords，50 个域名就会撞上
-#    Workers 免费版单次调用 50 个子请求的上限，超限部分被静默吞掉。
+# 定时任务：每小时跑一轮，一轮内**在预算内尽量多扫**账号（游标见 cron.ts 的 sync_cursor）。
+# ✅ 不会再撞 Workers 免费版单次调用 50 个子请求的上限，靠的是两层收敛：
+#    ① 增量：上游 subdomains/list 免费带回 updated_at，没变过的域名不再发 listDnsRecords
+#       （稳态每个账号只花 1 次子请求）；
+#    ② 预算：SYNC_SUBREQUEST_BUDGET = 34，按**域名**截断，剩下的账号留给下一轮。
+#    ⚠️ 改这里/改 syncOneAccountDomains 前先读 README 的「Worker 子请求上限的处理」。
 [triggers]
 crons = ["0 * * * *"]
 

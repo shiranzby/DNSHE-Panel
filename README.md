@@ -34,7 +34,7 @@ DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-ma
 ### 自动化与安全
 
 - **自动续期** — 定时扫描即将到期的域名并自动续期，无人值守
-- **配额感知的同步** — 单次调用受 Workers 免费版「50 个子请求」限制，同步按预算分批并把剩余部分交回前端续跑，不静默丢账号
+- **配额感知的同步** — 单次调用受 Workers 免费版「50 个子请求」限制，同步按**域名**预算分批并把剩余部分交回前端续跑，不静默丢账号
 - **通知推送** — 钉钉 / 飞书 / 企业微信 / Server酱 / Telegram / 自定义 Webhook / **邮箱 SMTP**
 - **安全认证** — 用户名 + 密码（PBKDF2 加盐哈希），可选 2FA (TOTP)；AES-GCM 加密存储 API Secret、API 密钥 Secret 与 2FA 密钥
 - **API 密钥页** — DNSHE 官方 API 密钥（key/secret）集中管理，Secret 加密保存、按需解密查看，支持批量创建与有效期展示
@@ -43,7 +43,7 @@ DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-ma
 
 ### 工程化
 
-- **子请求预算与轮转调度** — 定时任务每轮只同步一个账号、手动全量同步按预算分批续跑，避开 Workers 免费版「单次调用 50 个子请求」的上限（详见 [Worker 子请求上限的处理](#-worker-子请求上限的处理)）
+- **增量复核 + 子请求预算** — 上游 `updated_at` 没变过的域名不再重复查解析记录（稳态每账号只花 1 次子请求），配合按域名分档的预算，手动同步与定时任务都不会撞上 Workers 免费版「单次调用 50 个子请求」的上限（详见 [Worker 子请求上限的处理](#-worker-子请求上限的处理)）
 - **失败不再静默** — 同步失败会写进运行日志，不再出现「账号凭空消失但日志空白」
 
 ---
@@ -154,7 +154,9 @@ cd DNSHE-Panel
 npm install
 npm --prefix frontend install
 
-# 🔴 关键：必须带上这两个环境变量，缺 VITE_API_BASE_URL 会让线上登录报「未配置后端地址」
+# 🔴 关键：必须带 VITE_API_BASE_URL，缺了线上登录会直接报「未配置后端地址」
+#    （frontend/vite.config.ts 现在会在缺变量时让构建失败，避免静默上线；
+#      MSYS_NO_PATHCONV=1 也不能省 —— Git Bash 会把裸斜杠 / 改写成 Git 安装根目录）
 cd frontend
 MSYS_NO_PATHCONV=1 VITE_API_BASE_URL=/ npx vite build
 cd ..
@@ -223,13 +225,13 @@ DNSHE-Panel/
 │   ├── cron.ts                 #   定时同步与续期、Webhook/SMTP/Telegram 推送
 │   ├── dnshe.ts                #   DNSHE API 客户端
 │   ├── cloudflare.ts           #   Cloudflare API v4 客户端（zone 与解析记录）
-│   ├── dns-provider.ts         #   DNS 托管商识别（DoH 查询）
+│   ├── dns-provider.ts         #   DNS 托管商识别（DoH）+ 增量复核计划（planDnsChecks）与有界并发
 │   └── punycode.ts             #   国际化域名编码
 │
 ├── server/                     # 自建版专属（Node 运行时适配）
 │   ├── index.ts                #   Node 入口（env 组装、定时器、AES 密钥自举）
 │   ├── d1-sqlite.ts            #   D1 → SQLite 适配层（node:sqlite）
-│   ├── d1-sqlite.test.ts       #   适配层自检（17 项）
+│   ├── d1-sqlite.test.ts       #   适配层自检（21 项，含增量同步的时间戳语义）
 │   └── static.ts               #   静态资源服务（SPA 兜底、ETag、缓存头）
 │
 ├── frontend/                   # 前端（React + TypeScript + Vite）
@@ -272,8 +274,10 @@ npm install
 npm --prefix frontend install
 
 # ⚠️ 先构建一次前端：wrangler.toml 的 assets.directory 指向 frontend/dist，
-#    该目录不存在时 wrangler dev / deploy 会直接报错退出
-npm --prefix frontend run build
+#    该目录不存在时 wrangler dev / deploy 会直接报错退出。
+#    用 build:selfhost（读 .env.selfhost，已知同源基准地址）；直接跑 build 会因为
+#    缺 VITE_API_BASE_URL 而被 vite.config.ts 拦下 —— 这是故意的，见「改了前端代码」。
+npm --prefix frontend run build:selfhost
 
 # 启动后端（默认 8787，同时把 frontend/dist 当静态资源发出）
 npm run dev
@@ -296,7 +300,7 @@ npm run start:node
 | 表名 | 用途 |
 |------|------|
 | `accounts` | 账号（provider、别名、API Key / Cloudflare Token、加密后的 Secret） |
-| `domains_cache` | 域名缓存（状态、到期时间、NS、解析记录三态、续期记录） |
+| `domains_cache` | 域名缓存（状态、到期时间、NS、解析记录三态、续期记录、`remote_updated_at` 增量复核时间戳） |
 | `logs` | 系统运行日志（同步 / 续期 / 鉴权 / 系统分类） |
 | `cache` | 上游响应缓存（配额、查重池等，带过期时间） |
 | `settings` | 面板设置（含 SMTP 配置、通知渠道等，键值对） |
@@ -309,17 +313,27 @@ D1 与自建版用的都是 SQLite，表结构完全一致，可直接迁移（*
 
 Cloudflare Workers 免费版对**单次调用**有 50 个子请求的硬上限，`fetch` 以及 KV / D1 等绑定调用都计入。上游的实现是「一次性遍历所有账号 + 每个域名单独查一次 DNS 记录」，账号一多必然超限；超限抛出的 `Too many subrequests by single Worker invocation` 又会被账号级 `try/catch` 吞掉，循环里后面的账号直接跳过 —— 现象就是**部分账号的域名凭空消失，日志里却看不出原因**（上游 [issue #8](https://github.com/lioil522/dnshe-manager/issues/8)）。
 
-本仓库用三处约束把单次调用的子请求数压回上限以内：
+本仓库用四层约束把单次调用的子请求数压回上限以内：
 
 | 路径 | 约束方式 | 单次开销 |
 |------|----------|----------|
-| 手动全量同步 `POST /api/domains/sync` | **预算分批**：按「1 + 该账号已缓存域名数」预估开销（`SYNC_SUBREQUEST_BUDGET = 34`），预算不足即截断并在响应里回 `remaining`，前端拿到非空 `remaining` 就继续调用，直到 `done: true` | ≤ 34 |
-| 定时任务（Workers Cron / 自建版 node-cron） | **轮转**：每轮只处理**一个**账号，游标 `sync_cursor` 持久化在设置表，下一轮处理下一个账号 | `1 + 该账号域名数` |
+| **增量复核**（所有同步路径共用） | 上游 `subdomains/list` **免费**带回每个域名的 `updated_at`，而三态完全由该域名区域内的解析记录推导 ⇒「上游 `updated_at` 与上次复核时一致」等价于「三态没变」，那一次 `dns_records/list` 直接省掉。判据（`planDnsChecks`）：新域名 → 时间戳变了 → 缓存里的状态不是三态 → 本地行超过 7 天没被写过（兜底） | **稳态每个账号 1 次**（只有列表页），冷启动或域名改动后才按域名付费 |
+| 手动全量同步 `POST /api/domains/sync` | **按域名预算分批**：`SYNC_SUBREQUEST_BUDGET = 34` 是「本次调用允许消耗的网络子请求数」，同步与续期共享同一份预算；被截断的域名回 `pending`、账号回 `remaining`，前端按 `done` 接力直到清空 | ≤ 34 |
+| 定时任务（Workers Cron / 自建版 node-cron） | 同一份预算，从持久化游标 `sync_cursor` 起**顺序尽量多扫**（不再是每轮只扫一个账号）；预算见底就把剩下的账号留给下一轮，游标正好停在断点 | ≤ 34 |
 | 解析线路的 NS 查询 `POST /api/dnshe/ns-lookup` | **限额 + 缓存**：单次最多查 20 个根域名（`NS_MAX_ROOTS = 20`，每个最坏 2 次子请求），结论缓存 30 天 | ≤ 40 |
 
-定时任务偏保守：**账号全部覆盖一轮需要 N 小时**（N = 账号数），每小时触发一次，因此 6 个账号最多 6 小时就全部同步一遍，不会再出现「某个账号一直同步不进来」。同时，失败会写入运行日志（`sync` 分类），不再静默。
+线上实测（6 个 DNSHE 账号 + 1 个 Cloudflare 账号，共 50 个域名 / 29 个 zone）：
 
-> **已知边界：** 轮转只约束到「账号」这一层，没有做账号内的域名分页预算。所以**单个账号的域名数接近 40 个以上**时，那一轮仍可能超限。每账号十几个域名的规模不受影响；若单账号域名数很大，建议拆成多个 API Key 账号，或使用付费版 Workers（上限 1000）。
+| 场景 | 轮次 | 子请求 | 复核域名 | 用时 |
+|------|------|--------|----------|------|
+| 冷启动（`remote_updated_at` 全空） | 2 轮（34/34 → 24/34） | 58 | 50 | 28s |
+| 稳态 | 1 轮 | **7**（每账号 1 次） | 0 | 5s |
+
+> 复现脚本：`dnshe-deploy/.apitmp/verify-incremental-sync.py` —— 它会先把 `remote_updated_at` 清空来制造冷启动现场（可逆，下一次同步会原样填回），再跑稳态，最后按六条判据断言。
+
+**单账号域名超限**（原先的已知边界）已解决：预算落在**域名**这一层，不再是账号层。所以哪怕某个账号有几百个域名，一次调用也只复核预算内的那部分，剩下的走 `pending` / `remaining` 交给前端或下一轮 cron 继续 —— 不会再出现「后面的账号被静默跳过」。代价是极端情况下需要多次调用才能覆盖完全部域名，进度以前端按钮上的「同步中 x/y」呈现。
+
+定时任务同样不再受账号数限制：稳态下每个账号只要 1 次子请求，所以每小时一轮就能把全部账号过一遍（早先是「每轮一个账号」，6 个账号要 6 小时才轮到一圈）。
 
 ---
 
@@ -337,15 +351,15 @@ Cloudflare Workers 免费版对**单次调用**有 50 个子请求的硬上限�
 
 ### 同步域名时有的账号「凭空消失」？
 
-不是消失，是撞上了 Workers 免费版**单次调用 50 个子请求**的上限 —— 每个域名要单独查一次解析记录，超限部分会被静默丢弃。本项目已改成按预算分批：单次只同步预算内的账号，响应里带上 `remaining`，前端自动续跑直到清空。手工触发「同步所有账号」时请等它跑完。
+不是消失，是撞上了 Workers 免费版**单次调用 50 个子请求**的上限 —— 每个域名要单独查一次解析记录，超限部分会被静默丢弃，而异常又被账号级 `try/catch` 吃掉。本项目现在有两道保险：① **增量复核** —— 上游 `updated_at` 没变过的域名根本不发那次请求（稳态每账号只花 1 次）；② **按域名预算分批** —— 截断的域名回 `pending`、账号回 `remaining`，前端自动接力直到 `done: true`。手工触发「同步所有账号」时等按钮从「同步中 x/y」恢复即可。
+
+### 改了前端代码，构建成功但线上还是旧界面？
+
+先对比线上 `index.html` 里的资源哈希与你本地 `frontend/dist/assets/` 下的文件名。`wrangler deploy` 有可能打印「No updated asset files」却仍在上传旧产物；以「哈希变了 + 连续两次取到同一个哈希」为准。另外**不要漏掉 `VITE_API_BASE_URL=/`**：漏了会让登录直接报「未配置后端地址」（`frontend/vite.config.ts` 现在会直接让构建失败，避免静默上线）。⚠️ 在 Git Bash 里手写 `VITE_API_BASE_URL=/ npm run build` 同样会坏 —— MSYS2 会把裸斜杠改写成 Git 安装根目录，改用 `python dnshe-deploy/.apitmp/build-web.py` 或 `npm run build:selfhost`。
 
 ### 大陆访问 Cloudflare 版很慢怎么办？
 
 先看 `https://<你的域名>/cdn-cgi/trace` 里的 `colo=`：`HKG`/`NRT`/`KIX`/`SIN` 属正常；落到 `AMS`/`FRA` 等欧洲节点就是路由异常。免费套餐不使用中国大陆网络，**没有任何开关能改变这个路由**，只能换部署位置（见方式二 / 方式三）。注意 `colo` 反映的是**发起请求那台机器**落到哪个 PoP，开代理测出来的结果与大陆访客无关。
-
-### 改了前端代码，构建成功但线上还是旧界面？
-
-先对比线上 `index.html` 里的资源哈希与你本地 `frontend/dist/assets/` 下的文件名。`wrangler deploy` 有可能打印「No updated asset files」却仍在上传旧产物；以「哈希变了 + 连续两次取到同一个哈希」为准。另外**不要漏掉 `VITE_API_BASE_URL=/`**，漏了会让登录直接报「未配置后端地址」。
 
 ### 忘记管理员密码怎么办？
 

@@ -7,6 +7,10 @@ frontend/dist/
 .wrangler/
 *.log
 
+# 自建版运行数据目录（SQLite 库 + 自动生成的 aes.key）
+# 🔴 绝不能入库：aes.key 丢了库里 API Secret 解不开，进 git 则等于公开泄露
+data/
+
 # 本地专用：前端设计规范与配套静态校验脚本（仅本机使用，不随仓库发布）
 docs/前端设计规范.md
 check-controls-static.mjs
