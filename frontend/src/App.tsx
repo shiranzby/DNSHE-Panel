@@ -426,43 +426,52 @@ const DnsLineSelect: React.FC<{
  * 概览页网格列数档位
  *
  * NOTE: 上游把「一行 3 个」写死在 grid 类名里 —— 390px 手机端会挤成 3 个窄条，
- *       而宽屏右半边又空着。这里改成用户可调，且**每一档都自带移动端降级**。
- *       这些类名是字面量，Tailwind 的内容扫描能识别到，不会被摇掉。
+ *       而宽屏右半边又空着。这里改成用户可调。
+ *
+ * 🔴 2026-09-30 第15轮重定档位语义（用户反馈「怎么改列数都没反应」）：
+ *   - **auto 档独自承担移动端降级**：手机一律 1 列（用户原话「普通移动端的观感，
+ *     全部自适应默认为 1 列是最好的」）→ 平板 2 → 桌面 3 → 宽屏 4。
+ *   - **显式档（2/3/4/6）选几列就是几列**，不再降级。原来每档都在手机段写死 2 列，
+ *     于是 2/3/4/6 在手机上长得一模一样，用户以为控件坏了。选了没反应比选得挤更糟。
  */
 const OVERVIEW_COL_CLASS: Record<string, string> = {
-  auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4",
-  "2": "grid-cols-1 sm:grid-cols-2",
-  "3": "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3",
-  "4": "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4",
-  "6": "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6",
+  auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  "2": "grid-cols-2",
+  "3": "grid-cols-3",
+  "4": "grid-cols-4",
+  "6": "grid-cols-6",
 };
 
 /**
  * 账户配额卡的列数档位
  *
- * 与指标卡的区别：这里**手机端也从 2 列起**（配额卡内容只有「账号名 + 已用/总 + 一条进度条」，
- * 挤成 1 列会占掉半屏高度却只放一个数字）。指标卡信息更多，手机端仍是 1 列。
+ * 与指标卡**同一套档位语义**（手机 auto = 1 列）。原注释说「配额卡信息量小、手机端从 2 列起」，
+ * 但用户 2026-09-30 明确要求概览页手机端默认 1 列，两者改成一致。
  */
 const QUOTA_COL_CLASS: Record<string, string> = {
-  auto: "grid-cols-2 sm:grid-cols-2 lg:grid-cols-3",
-  "2": "grid-cols-2 sm:grid-cols-2",
-  "3": "grid-cols-2 sm:grid-cols-2 lg:grid-cols-3",
-  "4": "grid-cols-2 sm:grid-cols-2 lg:grid-cols-4",
-  "6": "grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6",
+  auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  "2": "grid-cols-2",
+  "3": "grid-cols-3",
+  "4": "grid-cols-4",
+  "6": "grid-cols-6",
 };
 
 /**
  * Cloudflare zone 卡的列数档位
  *
  * 上游把 zone 卡写死成 lg:grid-cols-3，宽屏右半边一直空着。
- * 这里与概览页同一套交互：auto 档按断点自适应 1→2→3→4 列，也可手动固定。
+ *
+ * 🔴 与概览页的**唯一区别**：CF 页的列数选择器手机端不展示（用户原话「移动端就默认一列，
+ *    不需要选择几列的控件」）⇒ 手机上看不到、也改不了这个值。若各档仍然直写
+ *    `grid-cols-3`，用户在桌面选过「3 列」后换手机打开就会莫名其妙是 3 列，
+ *    而手机上又没有入口改回去。所以每档都锁死手机段为 `grid-cols-1`，只有 ≥sm 才释放档位。
  */
 const CF_COL_CLASS: Record<string, string> = {
   auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
   "2": "grid-cols-1 sm:grid-cols-2",
-  "3": "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3",
-  "4": "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
-  "6": "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6",
+  "3": "grid-cols-1 sm:grid-cols-3",
+  "4": "grid-cols-1 sm:grid-cols-4",
+  "6": "grid-cols-1 sm:grid-cols-6",
 };
 
 const OVERVIEW_COL_OPTIONS = [
@@ -6130,16 +6139,36 @@ export default function App() {
               )}
             </button>
             {notifOpen && (
-              /* NOTE: w-80 在 390px 屏上会顶出右边界，窄屏改用视口宽度减去两侧留白 */
-              <div className="absolute right-0 mt-2 w-[calc(100vw-1.5rem)] sm:w-80 max-h-96 overflow-y-auto bg-elevated border border-border-base rounded-xl shadow-2xl z-50 p-2">
-                <div className="px-2 py-1.5 text-xs font-bold text-content-muted flex items-center justify-between">
-                  <span>最近告警</span>
-                  <button
-                    onClick={() => { markAlertsRead(); setActiveTab("logs"); setNotifOpen(false); }}
-                    className="text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 dark:hover:text-indigo-300"
-                  >
-                    查看全部
-                  </button>
+              /*
+                NOTE: 窄屏不能再锚在铃铛上（`absolute right-0`）。第15轮线上实测 390px：
+                      面板 x=-36 / w=366，而铃铛右缘在 330 ⇒ 整体偏左、左边被视口切掉
+                      （用户截图里「最近告警」被切成「级告警」、WARNING 切成 RNING）。
+                      手机端改为**脱离铃铛**：`fixed` + 左右各留 12px（与顶栏 px-3 对齐）+
+                      顶栏正下方（h-16 = 64px，再让 4px），这样天然左右对称、永远不出界；
+                      ≥sm 才回到「贴着铃铛右缘」的下拉形态。
+                      组件的祖先链上没有 transform/filter（§17 实测 transformedAncestors=[]），
+                      所以 `fixed` 不会被误当成 absolute 生效。
+              */
+              <div className="fixed left-3 right-3 top-16 mt-1 max-h-96 overflow-y-auto bg-elevated border border-border-base rounded-xl shadow-2xl z-50 p-2 sm:absolute sm:left-auto sm:right-0 sm:top-full sm:mt-2 sm:w-80">
+                <div className="px-2 py-1.5 text-xs font-bold text-content-muted flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate">最近告警</span>
+                  {/* 两个动作同为 h-6（§13 同行等高）：文字按钮 + 图标按钮 */}
+                  <div className="flex items-center gap-0.5 flex-shrink-0">
+                    <button
+                      onClick={() => { markAlertsRead(); setActiveTab("logs"); setNotifOpen(false); }}
+                      className="h-6 px-1.5 inline-flex items-center rounded-md text-indigo-600 hover:text-indigo-700 hover:bg-hovered dark:text-indigo-400 dark:hover:text-indigo-300 transition-all"
+                    >
+                      查看全部
+                    </button>
+                    <button
+                      onClick={() => setNotifOpen(false)}
+                      className="h-6 w-6 rounded-md text-content-muted hover:text-content-primary hover:bg-hovered transition-all inline-flex items-center justify-center"
+                      title="关闭"
+                      aria-label="关闭通知面板"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
                 {alertLogs.length === 0 ? (
                   <div className="px-2 py-6 text-center text-sm text-content-muted">暂无告警</div>
@@ -8132,29 +8161,43 @@ export default function App() {
 
                   {/* 5. 主控制按钮条
                       移动端 2×2 网格：一行两个左右均分，而不是让 flex-wrap 随缘折行
-                      （随缘折出来的第二行只有一个按钮孤零零贴一边）；桌面端仍是一行 */}
+                      （随缘折出来的第二行只有一个按钮孤零零贴一边）；桌面端仍是一行。
+
+                      🔴 2026-09-30 第15轮：用户报「查重里已经变成了两个 暂停查询」。
+                      线上复现（`.apitmp/diag-r15d.mjs`，拦截 /api/whois 造 paused 态）：
+                      暂停态下第 1 格是「恢复查询」、第 2 格是**disabled 的「暂停查询」**，
+                      两个并排、都跟"暂停"有关 ⇒ 读起来就是一个重复按钮。
+                      修法：**「暂停查询」只在 running 时出现**（其余状态它本来就是禁用态，
+                      隐藏零信息损失），第 1 格在非 running 时 `col-span-2` 独占整行，
+                      保证「左边永远是生命周期按钮、右边永远只有运行中的暂停」。
+                      另外 running 文案由「正在查重中...」缩为「正在查重」+ `whitespace-nowrap`：
+                      实测 390px 下 152px 的格子放不下 6 字 + 省略号，会折成两行把整行撑到 64px
+                      （邻行 44px），既违反 §13 又难看。 */}
                   <div className="grid grid-cols-2 md:flex md:flex-wrap md:items-center gap-3 border-t border-border-base pt-5">
                     <button
                       onClick={() => handleStartBatchScan()}
                       disabled={scanStatus === "running"}
-                      className="justify-center w-full md:w-auto bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 disabled:opacity-50"
+                      className={`justify-center w-full md:w-auto bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm px-3 sm:px-6 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 whitespace-nowrap disabled:opacity-50 ${
+                        scanStatus === "running" ? "" : "col-span-2"
+                      }`}
                     >
                       <Play className={`w-4 h-4 flex-shrink-0 ${scanStatus === "running" ? "animate-spin" : ""}`} />
-                      {scanStatus === "running" ? "正在查重中..." : scanStatus === "paused" ? "恢复查询" : "开始查询"}
+                      {scanStatus === "running" ? "正在查重" : scanStatus === "paused" ? "恢复查询" : "开始查询"}
                     </button>
 
-                    <button
-                      onClick={() => {
-                        const c = scanCursorRef.current;
-                        saveScanCursor(c.lastCandidate, c.taskIndex, c.checked);
-                        updateScanStatus("paused");
-                        showToast("info", `⏸️ 已暂停并保存断点（当前位置：${c.lastCandidate || "起点"}）`);
-                      }}
-                      disabled={scanStatus !== "running"}
-                      className="justify-center w-full md:w-auto bg-elevated hover:bg-hovered text-content-secondary font-semibold text-sm px-5 py-3 rounded-xl transition-all flex items-center disabled:opacity-50"
-                    >
-                      暂停查询
-                    </button>
+                    {scanStatus === "running" && (
+                      <button
+                        onClick={() => {
+                          const c = scanCursorRef.current;
+                          saveScanCursor(c.lastCandidate, c.taskIndex, c.checked);
+                          updateScanStatus("paused");
+                          showToast("info", `⏸️ 已暂停并保存断点（当前位置：${c.lastCandidate || "起点"}）`);
+                        }}
+                        className="justify-center w-full md:w-auto bg-elevated hover:bg-hovered text-content-secondary font-semibold text-sm px-3 sm:px-5 py-3 rounded-xl transition-all flex items-center whitespace-nowrap"
+                      >
+                        暂停查询
+                      </button>
+                    )}
 
                     <button
                       onClick={() => {
@@ -8165,7 +8208,7 @@ export default function App() {
                         clearScanCursor();
                         showToast("info", "🔄 已重置查重逻辑（断点已清除）");
                       }}
-                      className="justify-center w-full md:w-auto bg-elevated hover:bg-hovered text-content-secondary font-semibold text-sm px-5 py-3 rounded-xl transition-all flex items-center"
+                      className="justify-center w-full md:w-auto bg-elevated hover:bg-hovered text-content-secondary font-semibold text-sm px-3 sm:px-5 py-3 rounded-xl transition-all flex items-center whitespace-nowrap"
                     >
                       重新开始
                     </button>
@@ -8173,7 +8216,7 @@ export default function App() {
                     <button
                       onClick={handleExportAvailableTxt}
                       disabled={availableDomainsList.length === 0}
-                      className="justify-center w-full md:w-auto md:ml-auto bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm px-5 py-3 rounded-xl transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="justify-center w-full md:w-auto md:ml-auto bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm px-3 sm:px-5 py-3 rounded-xl transition-all flex items-center gap-2 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Download className="w-4 h-4 flex-shrink-0" />
                       导出为 txt
@@ -8519,14 +8562,16 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 工具行：列数选择 + 同步 + 收起/展开 —— 三者同排（§14 均分规则）
-                  窄屏 grid-cols-3 三等分；≥sm 恢复按内容宽度排列并靠右。
-                  没有 zone 时不渲染「收起/展开」，此时降为 2 等分，避免空出一格。
+              {/* 工具行：列数选择 + 同步 + 收起/展开
+                  窄屏（<sm）只保留「同步」+「收起/展开」两个动作按钮并 2 等分一行；
+                  列数选择器**只在 ≥sm 出现** —— 用户原话「移动端就默认一列，不需要选择几列的控件」，
+                  手机上一律走 CF_COL_CLASS.auto 的 1 列，留着选择器只会白占一格。
+                  没有 zone 时不渲染「收起/展开」，此时降为 1 等分，避免空出一格。
                   NOTE: 同步按钮原来是 `py-2 text-xs`（28~32px），和同行 h-10 的控件不等高 ——
                   同排必须同档，见 §13 / §20。 */}
-              <div className={`grid ${cfZones.length > 0 ? "grid-cols-3" : "grid-cols-2"} sm:flex sm:flex-wrap sm:items-center gap-2 w-full md:w-auto md:justify-end`}>
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-xs text-content-muted whitespace-nowrap hidden sm:inline">每行列数</span>
+              <div className={`grid ${cfZones.length > 0 ? "grid-cols-2" : "grid-cols-1"} sm:flex sm:flex-wrap sm:items-center gap-2 w-full md:w-auto md:justify-end`}>
+                <div className="hidden sm:flex items-center gap-2 min-w-0">
+                  <span className="text-xs text-content-muted whitespace-nowrap">每行列数</span>
                   <select
                     value={cfCols}
                     onChange={(e) => setCfCols(e.target.value)}
@@ -10026,12 +10071,10 @@ export default function App() {
                 <p className="text-content-muted">没有查到配额数据。请确保至少绑定了一个账户，并且密钥配置无误。</p>
               </div>
             ) : (
-              /* 自适应 1→4 列（用户 2026-09-30 要求）：极窄屏（<360px）1 列。
-                 为什么必须降到 1 列：2 列时卡片仅 122px，底部「可用/已用/总配额」
-                 三列每列约 24px，而「总配额」需要 33px，实测溢出 9px（280px）／2px（320px）。
-                 手机 2 列、桌面 3～4 列。四档全用 min-[...] 任意变体，避免与命名断点(sm/lg/xl)
-                 混用时被 Tailwind 的排序压回。 */
-              <div className="grid grid-cols-1 min-[360px]:grid-cols-2 min-[1024px]:grid-cols-3 min-[1280px]:grid-cols-4 gap-3 sm:gap-6">
+              /* 手机 1 列 → 平板 2 → 桌面 3 → 宽屏 4（用户 2026-09-30 第15轮：「移动端的账户配额页
+                 也改为一列布局」）。手机 1 列同时消掉了窄卡片溢出：2 列时卡片仅 122px，
+                 底部「可用/已用/总配额」每列约 24px，而「总配额」需要 33px（实测溢出 9px）。 */
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-6">
                 {filteredQuotas.map((q, idx) => {
                   if (q.error) {
                     return (
