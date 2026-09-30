@@ -1956,21 +1956,26 @@ export default function App() {
   /**
    * 概览卡片每行列数
    * NOTE: 上游把列数写死在 grid 类名里（一行 3 个），窄屏挤、宽屏空。
-   *       这里改成可调 + 每档都带移动端降级，见 OVERVIEW_COL_CLASS / QUOTA_COL_CLASS。
+   *       这里改成可调，档位语义见 OVERVIEW_COL_CLASS / QUOTA_COL_CLASS。
+   *
+   * 🔴 2026-09-30 第15轮：档位语义变了 ⇒ 键名升到 `_V2` 做**一次性迁移**。
+   *   旧版每档手机段都被写死（选 `3` 在手机上其实只给 2 列），新版 `3` 字面就是 3 列。
+   *   旧值的含义已失效，若继续沿用，用户在手机上会继承一个语义已经变了的数字，
+   *   而用户这次的要求正是「概览移动端默认 1 列」⇒ 让老值落空、回到 `auto` 才是对的。
    */
   const [overviewCols, setOverviewCols] = useState<string>(
-    () => localStorage.getItem("DNSHE_OVERVIEW_COLS") || "auto"
+    () => localStorage.getItem("DNSHE_OVERVIEW_COLS_V2") || "auto"
   );
   useEffect(() => {
-    localStorage.setItem("DNSHE_OVERVIEW_COLS", overviewCols);
+    localStorage.setItem("DNSHE_OVERVIEW_COLS_V2", overviewCols);
   }, [overviewCols]);
 
-  /** Cloudflare 页 zone 卡每行列数（独立于概览页，两页密度需求不同） */
+  /** Cloudflare 页 zone 卡每行列数（独立于概览页，两页密度需求不同）；键名迁移理由同上 */
   const [cfCols, setCfCols] = useState<string>(
-    () => localStorage.getItem("DNSHE_CF_COLS") || "auto"
+    () => localStorage.getItem("DNSHE_CF_COLS_V2") || "auto"
   );
   useEffect(() => {
-    localStorage.setItem("DNSHE_CF_COLS", cfCols);
+    localStorage.setItem("DNSHE_CF_COLS_V2", cfCols);
   }, [cfCols]);
 
   /** 账户配额的「筛选」抽屉是否展开 */
