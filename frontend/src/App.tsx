@@ -5771,12 +5771,13 @@ export default function App() {
   const logRowParts = (log: AppLog) => ({
     time: new Date(log.created_at).toLocaleString("zh-CN"),
     badge: (
-      /* 浅色主题下深色药丸底非常突兀 → 只留字色不加底；深色主题维持原底色 */
-      <span className={`inline-block px-2.5 py-0.5 rounded-full font-bold uppercase text-xs flex-shrink-0 ${
-        log.type === "success" ? "text-emerald-600 dark:bg-emerald-950 dark:text-emerald-400" :
-        log.type === "error" ? "text-red-600 dark:bg-red-950 dark:text-red-400 animate-pulse" :
-        log.type === "warning" ? "text-amber-600 dark:bg-amber-950 dark:text-amber-400" :
-        "text-content-secondary dark:bg-elevated"
+      /* §15（2026-09-30 修订）：浅色也带底 + 同色系浅边框，与卡片状态徽章同一套视觉。
+         此前这里的「浅色只留字色不加底」是 §15 旧版规则的唯一遗留，已按用户裁决统一。 */
+      <span className={`inline-block px-2.5 py-0.5 rounded-full font-bold uppercase text-xs flex-shrink-0 border ${
+        log.type === "success" ? "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60" :
+        log.type === "error" ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60 animate-pulse" :
+        log.type === "warning" ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-400 dark:border-amber-900/60" :
+        "bg-elevated text-content-secondary border-border-base dark:bg-elevated"
       }`}>
         {log.type}
       </span>
@@ -6077,7 +6078,7 @@ export default function App() {
           {/* 汉堡按钮：唤出手机抽屉（≥md 侧栏常驻，折叠切换在侧栏内部） */}
           <button
             onClick={() => setSidebarOpen(true)}
-            className="md:hidden h-9 w-9 p-0 -ml-1 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
+            className="md:hidden h-10 w-10 p-0 -ml-1 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
             title="打开菜单"
           >
             <Menu className="w-5 h-5" />
@@ -6119,7 +6120,7 @@ export default function App() {
             <button
               onClick={handleSyncDomains}
               disabled={actionLoading === "sync" || loadingDomains}
-              className="btn-primary h-9 px-2.5 sm:px-3.5 rounded-lg text-sm font-semibold text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+              className="btn-primary h-10 px-2.5 sm:px-3.5 rounded-lg text-sm font-semibold text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
             >
               <RefreshCw className={`w-4 h-4 ${actionLoading === "sync" ? "animate-spin" : ""}`} />
               <span className="hidden sm:inline">
@@ -6138,7 +6139,7 @@ export default function App() {
                 setNotifOpen(next);
                 if (next) markAlertsRead();
               }}
-              className="relative h-9 w-9 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex items-center justify-center"
+              className="relative h-10 w-10 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex items-center justify-center"
               title="告警通知"
             >
               <Bell className="w-5 h-5" />
@@ -6177,7 +6178,7 @@ export default function App() {
           {/* 主题切换 */}
           <button
             onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-            className="h-9 w-9 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
+            className="h-10 w-10 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
             title={theme === "dark" ? "切换到亮色" : "切换到暗色"}
           >
             {theme === "dark" ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
@@ -6186,7 +6187,7 @@ export default function App() {
           {/* 退出登录：手机上头部空间紧张，入口挪进抽屉底部 */}
           <button
             onClick={handleLogout}
-            className="hidden md:flex h-9 bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 rounded-lg text-sm font-semibold items-center gap-2 transition-all flex-shrink-0"
+            className="hidden md:flex h-10 bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 rounded-lg text-sm font-semibold items-center gap-2 transition-all flex-shrink-0"
             title="退出登录"
           >
             <LogIn className="w-4 h-4 text-amber-400" />
@@ -7558,7 +7559,7 @@ export default function App() {
                       <div className="bg-surface border border-emerald-500/30 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border-base pb-4">
                           <div className="min-w-0">
-                            <span className="inline-block bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
+                            <span className="inline-block bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
                               尚未注册
                             </span>
                             <h4 className="text-lg sm:text-xl font-bold text-content-primary break-all">
@@ -7610,7 +7611,7 @@ export default function App() {
                       <div className="bg-surface border border-red-500/30 rounded-2xl p-4 sm:p-6 shadow-xl space-y-4">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border-base pb-4">
                           <div className="min-w-0">
-                            <span className="inline-block bg-red-50 text-red-700 dark:bg-red-500/20 dark:text-red-400 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
+                            <span className="inline-block bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60 text-xs font-bold px-2.5 py-1 rounded-full mb-1">
                               已被注册
                             </span>
                             <h4 className="text-lg sm:text-xl font-bold text-content-secondary break-all">
@@ -10379,7 +10380,7 @@ export default function App() {
                       <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
                         <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0" />
                         <span className="text-sm font-semibold text-content-primary">两步验证 (2FA / TOTP)</span>
-                        <span className={`text-xs px-2.5 py-1 rounded-full font-semibold whitespace-nowrap flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
+                        <span className={`text-xs px-2.5 py-1 rounded-full font-semibold whitespace-nowrap flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60" : "bg-elevated text-content-muted border border-border-base"}`}>
                           {accountInfo.two_fa_enabled ? "已开启" : "未开启"}
                         </span>
                       </div>
