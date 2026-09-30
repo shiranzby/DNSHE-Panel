@@ -40,6 +40,14 @@ export interface SubdomainInfo {
   status: string;
   expires_at?: string;
   created_at?: string;
+  /**
+   * 上游的最后修改时间
+   *
+   * NOTE: 实测 subdomains/list 默认返回该字段，域名区域里任何解析记录被增删改都会推进它。
+   * 三态（已委派/已解析/未解析）完全由区域内记录推导，因此它没变 ⇔ 三态没变 ——
+   * 增量同步据此跳过没必要的 dns_records/list 调用（见 dns-provider.ts 的 planDnsChecks）。
+   */
+  updated_at?: string;
   disable_ns_management?: boolean | number;
   has_dns?: boolean | number;
   ns1?: string;

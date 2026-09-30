@@ -6,7 +6,7 @@ import type { DBDomain } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { ApiKeyInfo, CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
-import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, syncOneAccountDomains, sendTelegramNotification, sendWebhookNotification, sendSmtpMail } from "./cron";
+import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, syncOneAccountDomains, sendTelegramNotification, sendWebhookNotification, sendSmtpMail, SYNC_SUBREQUEST_BUDGET } from "./cron";
 import type { WebhookType } from "./cron";
 import { computeDnsState } from "./dns-provider";
 import type { DnsState } from "./dns-provider";
@@ -1055,7 +1055,7 @@ app.get("/api/domains", async (c) => {
 
 // 2. 立即全量同步所有账号的域名
 /**
- * 立即同步域名（分批版）
+ * 立即同步域名（增量 + 预算分批）
  *
  * 🔴 不再一次性同步全部账号：每个域名要单独查一次 DNS 记录，整包同步会撞上
  *    Workers 免费版「单次调用 50 个子请求」的上限，超限后**后续账号被静默跳过**
@@ -1065,10 +1065,17 @@ app.get("/api/domains", async (c) => {
  *   POST { account_ids?: number[] }
  *     - 不传 → 从全部账号开始，尽量多同步；
  *     - 传 remaining → 接着上一批未完成的部分继续。
- *   响应 { synced: [...], remaining: [...], failed: [...] }
+ *   响应 { synced: [...], failed: [...], remaining: [...], pending, done, budget }
  *   前端在 remaining 非空时继续调用，直到清空。
+ *
+ * 🔴 两层收敛：① 增量 —— 上游 updated_at 没变过的域名不再重复查解析记录，
+ *    稳态下一个账号只花 1 次子请求；② 预算 —— 单个账号域名再多也只查预算内的那些
+ *    （变过的优先、最久没查的靠前），剩下的进 remaining 下次继续，
+ *    于是「一个账号 200 个域名」也不会再撞天花板。
  */
-const SYNC_SUBREQUEST_BUDGET = 34; // 留出余量给 D1 与鉴权查询，上限是 50
+const SYNC_BUDGET = SYNC_SUBREQUEST_BUDGET;
+/** 预算之下还给每个账号留一次列表请求的余量，避免最后一个账号连列表都拉不到 */
+const SYNC_MIN_ACCOUNT_COST = 1;
 
 app.post("/api/domains/sync", async (c) => {
   const dbManager = c.get("db");
@@ -1085,34 +1092,47 @@ app.post("/api/domains/sync", async (c) => {
       ? (body.account_ids as unknown[]).map((x) => parseInt(String(x), 10)).filter((n) => Number.isFinite(n))
       : null;
 
-    // 保守估算每个账号的开销：1 次列子域名 + 每域名 1 次查 DNS 记录
-    const counts = await dbManager.getDomains("", "", undefined, undefined);
-    const cachedByAccount = new Map<number, number>();
-    for (const d of counts) {
-      cachedByAccount.set(d.account_id, (cachedByAccount.get(d.account_id) || 0) + 1);
-    }
-
     const queue = requested
       ? allAccounts.filter((a) => requested.includes(a.id))
       : [...allAccounts];
 
-    const synced: Array<{ id: number; alias: string; count: number }> = [];
+    const synced: Array<{
+      id: number; alias: string; count: number; checked: number; pending: number; rateLimited: boolean;
+    }> = [];
     const failed: Array<{ id: number; alias: string; error: string }> = [];
     const remaining: number[] = [];
-    let budget = SYNC_SUBREQUEST_BUDGET;
+    const limitedAliases: string[] = [];
+    let pendingDomains = 0;
+    let budget = SYNC_BUDGET;
 
     for (let i = 0; i < queue.length; i++) {
       const acc = queue[i];
-      const cost = 1 + (cachedByAccount.get(acc.id) || 0);
-      // 预算不够就停下，把剩下的交回前端下一批继续（首个账号无论如何都放行，避免饿死）
-      if (synced.length + failed.length > 0 && cost > budget) {
+      // 连「拉一次列表」的预算都没有了就交回前端；首个账号无论如何放行，避免饿死
+      if (synced.length + failed.length > 0 && budget < SYNC_MIN_ACCOUNT_COST) {
         remaining.push(...queue.slice(i).map((a) => a.id));
         break;
       }
-      budget -= cost;
       try {
-        const r = await syncOneAccountDomains(dbManager, acc.id);
-        synced.push({ id: acc.id, alias: r.alias, count: r.count });
+        const r = await syncOneAccountDomains(dbManager, acc.id, { budget });
+        budget -= r.used;
+        synced.push({
+          id: acc.id,
+          alias: r.alias,
+          count: r.count,
+          checked: r.checked,
+          pending: r.pending,
+          rateLimited: r.rateLimited,
+        });
+        if (r.rateLimited) limitedAliases.push(r.alias);
+
+        // 还有没复核完的域名 → 这个账号要再来一轮。
+        // 但只有「本轮确实推进了」才排进 remaining：否则限流/持续失败会让前端无限空转。
+        if (r.pending > 0) {
+          pendingDomains += r.pending;
+          // 因预算被截断的域名下一轮必然能推进 -> 继续接力；
+          // 纯失败（限流/网络抖动）不接力，否则前端会无限空转。
+          if (r.pending > r.failedChecks) remaining.push(acc.id);
+        }
       } catch (e: unknown) {
         failed.push({ id: acc.id, alias: acc.alias, error: e instanceof Error ? e.message : "同步失败" });
       }
@@ -1126,11 +1146,20 @@ app.post("/api/domains/sync", async (c) => {
         `域名同步有 ${failed.length} 个账号失败：${failed.map((f) => `${f.alias}（${f.error}）`).join("、")}`
       );
     }
+    if (limitedAliases.length > 0) {
+      await dbManager.writeLog(
+        "warning",
+        "sync",
+        `以下账号的解析记录复核被上游限流拦截，已保留旧三态并会在下一轮重试：${limitedAliases.join("、")}`
+      );
+    }
     if (synced.length > 0) {
+      const checkedTotal = synced.reduce((s, x) => s + x.checked, 0);
+      const domainTotal = synced.reduce((s, x) => s + x.count, 0);
       await dbManager.writeLog(
         "success",
         "sync",
-        `域名同步完成 ${synced.length} 个账号，共 ${synced.reduce((s, x) => s + x.count, 0)} 个域名` +
+        `域名同步完成 ${synced.length} 个账号，共 ${domainTotal} 个域名（其中 ${checkedTotal} 个触发了增量复核）` +
           (remaining.length > 0 ? `；还有 ${remaining.length} 个账号待继续` : "")
       );
     }
@@ -1139,7 +1168,10 @@ app.post("/api/domains/sync", async (c) => {
       synced,
       failed,
       remaining,
-      done: remaining.length === 0,
+      /** 还需上网复核的域名总数，前端据此显示真实进度 */
+      pending: pendingDomains,
+      done: remaining.length === 0 && pendingDomains === 0,
+      budget: { limit: SYNC_BUDGET, used: SYNC_BUDGET - budget },
     }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";

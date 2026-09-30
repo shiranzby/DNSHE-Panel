@@ -17,6 +17,8 @@ import { DatabaseSync } from "node:sqlite";
 
 import { DatabaseManager } from "../src/db";
 import type { UpstreamSubdomain } from "../src/db";
+import { planDnsChecks, DNS_THREE_STATES } from "../src/dns-provider";
+import type { CachedDomainStamp } from "../src/dns-provider";
 import { createD1FromSqlite } from "./d1-sqlite";
 
 const AES_KEY = "test-only-key-do-not-reuse";
@@ -143,6 +145,97 @@ await it("dns_state_known 缺失时不覆盖已识别出的三态", async () => 
   const alpha = await dbm.getDomainById(101);
   assert.equal(alpha?.status, "已委派", "三态被上游注册态覆盖了");
   assert.equal(alpha?.dns_provider, "Cloudflare");
+});
+
+await it("remote_updated_at 只在真正复核过时才写入（增量同步的判据）", async () => {
+  // 复核过：带上上游时间戳
+  await dbm.syncAccountDomains(1, [
+    sub(101, "alpha", { remote_updated_at: "2026-09-29 21:40:44" }),
+  ]);
+  assert.equal((await dbm.getDomainById(101))?.remote_updated_at, "2026-09-29 21:40:44");
+
+  // 没复核（缺 dns_state_known）：不能动已存的时间戳，更不能把它写成 null ——
+  // 否则下次同步会把这个域名当成「从没查过」而永久重复查询
+  await dbm.syncAccountDomains(1, [
+    sub(101, "alpha", { dns_state_known: undefined, remote_updated_at: "2026-09-29 21:40:44" }),
+    sub(102, "beta"),
+  ]);
+  assert.equal((await dbm.getDomainById(101))?.remote_updated_at, "2026-09-29 21:40:44");
+  assert.equal((await dbm.getDomainById(102))?.remote_updated_at, null);
+});
+
+await it("getDomainSyncIndex() 一次取回全部域名的增量快照", async () => {
+  const index = await dbm.getDomainSyncIndex();
+  const alpha = index.get(101);
+  assert.ok(alpha, "快照里缺少已存在的域名");
+  assert.equal(alpha.account_id, 1);
+  assert.ok(DNS_THREE_STATES.has(String(alpha.status)), "快照里的 status 应是三态之一");
+  assert.equal(alpha.remote_updated_at, "2026-09-29 21:40:44");
+  assert.ok(alpha.updated_at, "缺 updated_at 就无法判断「多久没复核过」");
+  // 未复核过的域名 remote_updated_at 为 null（下次同步会把它排进复核队列）
+  assert.equal(index.get(102)?.remote_updated_at, null);
+});
+
+await it("planDnsChecks() 只挑出真正需要联网复核的域名", () => {
+  const stamp = (status: string, remote: string | null, updated: string | null): CachedDomainStamp => ({
+    status,
+    remote_updated_at: remote,
+    updated_at: updated,
+  });
+  const stamps = new Map<number, CachedDomainStamp>([
+    [1, stamp("已解析", "2026-09-01 00:00:00", "2026-09-30 10:00:00")],
+    [2, stamp("已解析", "2026-09-01 00:00:00", "2026-09-30 10:00:00")],
+    [3, stamp("active", null, "2026-09-30 10:00:00")],
+    [4, stamp("已委派", "2026-08-01 00:00:00", "2026-08-01 09:00:00")],
+    [6, stamp("已解析", "2026-09-01 00:00:00", "2026-09-30 10:00:00")],
+  ]);
+  const listed = [
+    { id: 1, updated_at: "2026-09-01 00:00:00" }, // 上游没变 + 三态已知 → 跳过（唯一省下子请求的一条）
+    { id: 2, updated_at: "2026-09-20 00:00:00" }, // 上游变过 → changed
+    { id: 3, updated_at: "2026-09-01 00:00:00" }, // 缓存里不是三态 → unknown-state
+    { id: 4, updated_at: "2026-08-01 00:00:00" }, // 上游没变但太久没复核 → stale
+    { id: 5, updated_at: "2026-09-01 00:00:00" }, // 缓存里没有 → new
+    { id: 6 },                                    // 上游不给时间戳 → 不敢跳过 → changed
+  ];
+
+  const plan = planDnsChecks(listed, stamps, "2026-09-25 00:00:00");
+  assert.equal(plan.skipped, 1, "只有 id=1 该被跳过");
+  // 优先级：new → changed → unknown-state → stale
+  assert.deepEqual(plan.ids, [5, 2, 6, 3, 4]);
+  assert.equal(plan.reasons.get(5), "new");
+  assert.equal(plan.reasons.get(2), "changed");
+  assert.equal(plan.reasons.get(6), "changed");
+  assert.equal(plan.reasons.get(3), "unknown-state");
+  assert.equal(plan.reasons.get(4), "stale");
+
+  // 关掉时间兜底时，只有「上游没变 + 三态已知」的才跳过
+  const noCutoff = planDnsChecks(listed, stamps, null);
+  assert.ok(!noCutoff.ids.includes(4), "cutoff=null 时不该因年龄复核");
+  assert.ok(!noCutoff.ids.includes(1));
+});
+
+await it("planDnsChecks() 同优先级内按「最久没复核」排队", () => {
+  const mk = (updated: string): CachedDomainStamp => ({
+    status: "已解析",
+    remote_updated_at: "2026-01-01 00:00:00",
+    updated_at: updated,
+  });
+  // 全部都是 changed（上游时间戳与缓存不一致），按本地写入时间升序
+  const stamps = new Map<number, CachedDomainStamp>([
+    [11, mk("2026-09-30 10:00:00")],
+    [12, mk("2026-08-01 10:00:00")],
+    [13, mk("2026-09-01 10:00:00")],
+  ]);
+  const plan = planDnsChecks(
+    [
+      { id: 11, updated_at: "2026-09-30 00:00:00" },
+      { id: 12, updated_at: "2026-09-30 00:00:00" },
+      { id: 13, updated_at: "2026-09-30 00:00:00" },
+    ],
+    stamps,
+    null
+  );
+  assert.deepEqual(plan.ids, [12, 13, 11], "预算不够时应优先刷新最久没查过的");
 });
 
 await it("upsertDomain() 单条写入走同一个 bind() 结果（不可变语义）", async () => {

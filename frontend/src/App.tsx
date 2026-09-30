@@ -2801,21 +2801,27 @@ export default function App() {
 
   // 立即发起域名同步
   /**
-   * 立即同步域名（分批接力）
+   * 立即同步域名（增量 + 分批接力）
    *
-   * 🔴 必须分批：后端每个域名要单独查一次 DNS 记录，整包同步会撞上 Workers 免费版
-   *    「单次调用 50 个子请求」的上限，超限后**后续账号被静默跳过** ——
-   *    以前的表现就是「域名列表里某些账号凭空消失」。现在后端一次只同步能塞进预算的
-   *    那几个账号并回传 remaining，这里循环接力直到清空。
+   * 🔴 后端两层收敛：① 增量 —— 上游 updated_at 没变过的域名不再重复查解析记录，
+   *    稳态下一个账号只花 1 次子请求、「复核」数量为 0；② 预算 —— 单次调用只查得完
+   *    预算内的域名（默认 34 个），剩下的用 pending 回传，这里循环接力直到清空。
+   *    于是「某个账号域名特别多」也不会再撞上 Workers 免费版 50 个子请求的硬顶。
+   *
+   * NOTE: 进度以**域名**为单位（复核过的 / 复核过的 + 还欠着的），
+   * 而不是账号数 —— 账号会被拆到多轮里，按账号计会重复计数（§8）。
    */
   const handleSyncDomains = async () => {
     setActionLoading("sync");
     setSyncProgress({ done: 0, total: 0 });
     try {
       let remaining: number[] | null = null;
-      let doneCount = 0;
       let round = 0;
+      let checkedDomains = 0;
+      let leftDomains = 0;
+      const doneAccounts = new Set<number>();
       const failedAliases: string[] = [];
+      const limitedAliases: string[] = [];
 
       do {
         round++;
@@ -2829,18 +2835,34 @@ export default function App() {
           showToast("error", data.message || "启动同步域名任务失败");
           return;
         }
-        doneCount += (data.synced || []).length;
+        for (const s of data.synced || []) {
+          doneAccounts.add(s.id);
+          checkedDomains += s.checked || 0;
+          if (s.rateLimited) limitedAliases.push(s.alias);
+        }
         for (const f of data.failed || []) failedAliases.push(f.alias);
+        leftDomains = data.pending || 0;
         remaining = data.remaining && data.remaining.length ? data.remaining : null;
-        setSyncProgress({ done: doneCount, total: doneCount + (remaining ? remaining.length : 0) });
-      } while (remaining && round < 12);
+        setSyncProgress({ done: checkedDomains, total: checkedDomains + leftDomains });
+      } while (remaining && round < 40);
 
       await fetchDomains();
+      // 三种收尾状态都要说出来，不能只报「已同步」（§8）
+      const notes: string[] = [];
+      if (failedAliases.length > 0) {
+        notes.push(`${failedAliases.length} 个账号失败：${failedAliases.join("、")}`);
+      }
+      if (limitedAliases.length > 0) {
+        notes.push(`${limitedAliases.join("、")} 被上游限流，其余域名下次同步会自动补齐`);
+      }
+      if (leftDomains > 0 && remaining === null) {
+        notes.push(`还有 ${leftDomains} 个域名未复核，再点一次同步可继续`);
+      }
+      const summary = `已同步 ${doneAccounts.size} 个账号的域名` +
+        (checkedDomains > 0 ? `（本次复核 ${checkedDomains} 个变更）` : "，全部为最新");
       showToast(
-        failedAliases.length > 0 ? "warning" : "success",
-        failedAliases.length > 0
-          ? `同步完成 ${doneCount} 个账号；${failedAliases.length} 个失败：${failedAliases.join("、")}`
-          : `已同步 ${doneCount} 个账号的域名`
+        notes.length > 0 ? "warning" : "success",
+        notes.length > 0 ? `${summary}；${notes.join("；")}` : summary
       );
     } catch (e) {
       showToast("error", "发起域名同步网络请求失败");

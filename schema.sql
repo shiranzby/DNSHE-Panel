@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS domains_cache (
     dns_provider TEXT,                    -- DNS 托管商 (system/Cloudflare/DNSPod/Vercel/vps8/external)
     provider_account_id TEXT,             -- 解析服务商账号 ID，线路支持判定的兜底信号（主判定用根域 NS，详见 src/dnshe.ts 注释）
     remote_id TEXT,                       -- 上游对象 ID（Cloudflare 存 zone id；DNSHE 行留空，主键 id 即 subdomain_id）
+    remote_updated_at TEXT,               -- 上次成功复核解析记录时上游给的 updated_at；增量同步据此跳过没变过的域名
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );

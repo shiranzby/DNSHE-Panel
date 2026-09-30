@@ -1,8 +1,21 @@
 import { DNSHEClient } from "./dnshe";
 import { CloudflareClient } from "./cloudflare";
+import { DNS_THREE_STATES } from "./dns-provider";
 
 /** 绑定账号的提供商 */
 export type AccountProvider = "dnshe" | "cloudflare";
+
+/**
+ * 把任意时刻格式化成与日志/缓存时间一致的北京时间字符串
+ *
+ * NOTE: 格式定宽（YYYY-MM-DD HH:mm:ss.sss），因此字符串比较等价于时间先后比较 ——
+ * 增量同步判断「缓存行多久没被写过」时就靠这个性质，不需要解析回时间戳。
+ */
+export function beijingTimeString(date: Date): string {
+  const beijingOffset = 8 * 60 * 60 * 1000;
+  const beijingTime = new Date(date.getTime() + beijingOffset);
+  return beijingTime.toISOString().replace("T", " ").replace("Z", "");
+}
 
 /**
  * 归一化自动解析出的 Cloudflare 账号别名
@@ -183,6 +196,8 @@ export interface DBDomain {
   provider_account_id?: string | null;
   /** 上游对象 ID：Cloudflare 行存 zone id；DNSHE 行为空，主键 id 即 subdomain_id */
   remote_id?: string | null;
+  /** 上次成功复核解析记录时上游给的 updated_at（增量同步的比对依据） */
+  remote_updated_at?: string | null;
   updated_at: string;
 }
 
@@ -219,10 +234,32 @@ export interface UpstreamSubdomain {
   /** Cloudflare 行携带 zone id；DNSHE 行留空 */
   remote_id?: string | null;
   dns_state_known?: boolean;
+  /**
+   * 复核解析记录时上游 subdomains/list 给的 updated_at（北京时间的原样字符串）
+   *
+   * NOTE: 只有「本次确实拉了 dns_records/list」时才允许带这个字段 ——
+   * 它是下次跳过网络请求的依据，未复核就写入会让该域名被永久跳过。
+   */
+  remote_updated_at?: string;
 }
 
-/** domains_cache.status 允许的三态取值（由 computeDnsState 产出） */
-const THREE_STATE_STATUSES = new Set(["已委派", "已解析", "未解析"]);
+/** domains_cache.status 允许的三态取值（单一真源在 dns-provider.ts，由 computeDnsState 产出） */
+const THREE_STATE_STATUSES = DNS_THREE_STATES;
+
+/**
+ * 增量同步用的域名快照（见 DatabaseManager.getDomainSyncIndex）
+ *
+ * 字段名与 dns-provider.ts 的 CachedDomainStamp 对齐，便于直接喂给 planDnsChecks。
+ */
+export interface DomainSyncStamp {
+  id: number;
+  account_id: number;
+  status: string | null;
+  remote_updated_at: string | null;
+  updated_at: string | null;
+}
+
+
 
 /** 全部账号配额的缓存键（内容为按 account_id 升序排列的数组） */
 export const QUOTA_CACHE_KEY = "api_cache:quota";
@@ -278,6 +315,7 @@ export class DatabaseManager {
             dns_provider TEXT,
             provider_account_id TEXT,
             remote_id TEXT,
+            remote_updated_at TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
           );
@@ -342,6 +380,9 @@ export class DatabaseManager {
       }
       if (!existingColumns.has("remote_id")) {
         migrations.push("ALTER TABLE domains_cache ADD COLUMN remote_id TEXT");
+      }
+      if (!existingColumns.has("remote_updated_at")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN remote_updated_at TEXT");
       }
       const accountColumns = await this.db.prepare("PRAGMA table_info(accounts)").all<{ name: string }>();
       const accountColumnNames = new Set((accountColumns.results || []).map((column) => column.name));
@@ -870,9 +911,7 @@ export class DatabaseManager {
    * 格式定宽（YYYY-MM-DD HH:mm:ss.sss），因此字符串比较等价于时间先后比较。
    */
   private toBeijingString(date: Date): string {
-    const beijingOffset = 8 * 60 * 60 * 1000;
-    const beijingTime = new Date(date.getTime() + beijingOffset);
-    return beijingTime.toISOString().replace("T", " ").replace("Z", "");
+    return beijingTimeString(date);
   }
 
   /**
@@ -1277,6 +1316,26 @@ export class DatabaseManager {
   }
 
   /**
+   * 读取全部域名的「增量同步快照」
+   *
+   * NOTE: 一条 SELECT 返回所有账号的 id / 三态 / 上游时间戳 / 本地写入时间，
+   * 供同步层判断哪些域名需要上网复核，也供路由估算子请求预算。
+   * 先前路由为了统计「每个账号有多少域名」走的是 getDomains()（全字段 + JOIN 别名），
+   * 数据量与开销都远大于这里真正需要的四列。
+   */
+  async getDomainSyncIndex(): Promise<Map<number, DomainSyncStamp>> {
+    const res = await this.db.prepare(
+      "SELECT id, account_id, status, remote_updated_at, updated_at FROM domains_cache"
+    ).all<DomainSyncStamp>();
+
+    const index = new Map<number, DomainSyncStamp>();
+    for (const row of res.results || []) {
+      index.set(Number(row.id), row);
+    }
+    return index;
+  }
+
+  /**
    * 构造单条域名的 UPSERT 语句
    *
    * NOTE: 只有当调用方带上 dns_state_known（即本次确实拉取到了该域名的解析记录）时，
@@ -1317,6 +1376,10 @@ export class DatabaseManager {
             dns_provider = COALESCE(excluded.dns_provider, domains_cache.dns_provider),`
       : "";
 
+    // 上游时间戳只在「本次确实复核过」时写入 —— 见 UpstreamSubdomain.remote_updated_at 的注释。
+    // 未复核的行留 NULL，增量同步据此把它当作「还没查过」而非「已是最新」。
+    const remoteUpdatedAt = sub.dns_state_known ? sub.remote_updated_at || null : null;
+
     // 绑定的 status 在「解析状态未知」时只对 INSERT 生效（新行没有旧值可保留）。
     //
     // NOTE: 此时上游给的是注册态（active / Registered），前端会把它显示成「已解析」——
@@ -1327,12 +1390,13 @@ export class DatabaseManager {
       : "未解析";
 
     return this.db.prepare(`
-      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, remote_id, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, remote_id, remote_updated_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         account_id = excluded.account_id,
         provider_account_id = COALESCE(excluded.provider_account_id, domains_cache.provider_account_id),
         remote_id = COALESCE(excluded.remote_id, domains_cache.remote_id),
+        remote_updated_at = COALESCE(excluded.remote_updated_at, domains_cache.remote_updated_at),
         ${dnsStateAssignments}
         created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
         expires_at = excluded.expires_at,
@@ -1350,6 +1414,7 @@ export class DatabaseManager {
       dnsProvider,
       providerAccountId,
       sub.remote_id || null,
+      remoteUpdatedAt,
       this.getBeijingNow()
     );
   }
