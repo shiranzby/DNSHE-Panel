@@ -1577,6 +1577,11 @@ export default function App() {
   };
 
   // 渲染域名三态徽章：未解析 / 已解析 / 已委派
+  //
+  // 🔴 必须 `whitespace-nowrap flex-shrink-0`：徽章与域名同在一行 flex 里，
+  //    卡片变窄（768/1024 两列布局）时 flex 会把徽章压到不足一个字的宽度，
+  //    「已解析」被折成「已解\n析」两行 —— 高度从 22px 变 38px，卡片参差不齐。
+  //    域名那侧本来就有 `truncate min-w-0`，所以让徽章不让步是对的（§15）。
   const renderStatusBadge = (dom: Domain) => {
     let statusText = dom.status;
     const isDelegated = Number(dom.has_dns) === 0 || dom.status === "已委派";
@@ -1591,20 +1596,20 @@ export default function App() {
 
     if (statusText === "已委派") {
       return (
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-800/60">
+        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap flex-shrink-0 bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-800/60">
           已委派
         </span>
       );
     }
     if (statusText === "已解析") {
       return (
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60">
+        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap flex-shrink-0 bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60">
           已解析
         </span>
       );
     }
     return (
-      <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-elevated text-content-muted border border-border-base">
+      <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap flex-shrink-0 bg-elevated text-content-muted border border-border-base">
         未解析
       </span>
     );
@@ -4645,11 +4650,11 @@ export default function App() {
             {unicodeDomain}
           </button>
           {isActive ? (
-            <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60 flex-shrink-0">
+            <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60 flex-shrink-0">
               已激活
             </span>
           ) : (
-            <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60 flex-shrink-0">
+            <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60 flex-shrink-0">
               待激活
             </span>
           )}
@@ -10334,7 +10339,7 @@ export default function App() {
                       <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
                         <ShieldCheck className="w-4 h-4 text-emerald-400 flex-shrink-0" />
                         <span className="text-sm font-semibold text-content-primary">两步验证 (2FA / TOTP)</span>
-                        <span className={`text-xs px-2.5 py-1 rounded-full font-semibold flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
+                        <span className={`text-xs px-2.5 py-1 rounded-full font-semibold whitespace-nowrap flex-shrink-0 ${accountInfo.two_fa_enabled ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400" : "bg-elevated text-content-muted border border-border-base"}`}>
                           {accountInfo.two_fa_enabled ? "已开启" : "未开启"}
                         </span>
                       </div>
