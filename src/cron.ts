@@ -62,7 +62,7 @@ type WorkerConnect = (
  * NOTE: 支持按 WEBHOOK_TYPE 环境变量构造对应平台的规范 payload，
  * 而非同时携带所有平台的字段。
  */
-export type WebhookType = "dingtalk" | "feishu" | "wecom" | "serverchan" | "custom" | "email";
+export type WebhookType = "dingtalk" | "feishu" | "wecom" | "serverchan" | "custom" | "email" | "telegram";
 
 /**
  * Webhook 推送结果
@@ -761,6 +761,19 @@ export async function runDailySyncAndRenewal(
       if (!result.ok) {
         await dbManager.writeLog("warning", "system", "续期报告邮件发送失败（SMTP）", result.detail || "");
       }
+    } else if (effectiveWebhookType === "telegram") {
+      // 🔴 2026-09-30 语义变更：Telegram 从「无论如何都额外再发一份」改成
+      //    「渠道选择里被选中的那一个」。设置页已把 Telegram 并进统一的渠道下拉，
+      //    若仍保持无条件补发，用户选了「邮箱」也会收到 TG 消息，与界面表达不符。
+      if (tgToken && tgChatId) {
+        await sendTelegramNotification(tgToken, tgChatId, notifyBody);
+      } else {
+        await dbManager.writeLog(
+          "warning",
+          "system",
+          "续期报告 Telegram 推送跳过：Bot Token 或 Chat ID 未配置"
+        );
+      }
     } else if (effectiveWebhookUrl) {
       // NOTE: 推送失败要留痕 —— 原先只 console.error，用户在面板里完全看不到，
       // 表现为「续期成功了但一直没收到通知」且无从排查。
@@ -773,9 +786,6 @@ export async function runDailySyncAndRenewal(
           result.detail || `HTTP ${result.status ?? "?"}`
         );
       }
-    }
-    if (tgToken && tgChatId) {
-      await sendTelegramNotification(tgToken, tgChatId, notifyBody);
     }
   }
 }

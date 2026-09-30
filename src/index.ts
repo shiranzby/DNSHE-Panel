@@ -2215,6 +2215,22 @@ app.post("/api/settings/test-webhook", async (c) => {
       return c.json(successRes({ message: "测试邮件已发送，请查收（也看一下垃圾箱）" }));
     }
 
+    // Telegram 自 2026-09-30 起也是「被选中的一个渠道」（不再是无条件补发的那一份），
+    // 因此和 email 一样只校验自己的参数，不要求填 webhook 地址。
+    if (type === "telegram") {
+      const pick = (k: string) => {
+        const v = body[k];
+        return v && !String(v).startsWith("****") ? String(v).trim() : String(cfg[k] || "");
+      };
+      const token = pick("tg_token");
+      const chatId = pick("tg_chat_id");
+      if (!token || !chatId) {
+        return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
+      }
+      await sendTelegramNotification(token, chatId, "🎉 DNSHE 集控台 测试推送：Telegram 通知渠道配置成功！");
+      return c.json(successRes({ message: "测试消息已发送，请检查 Telegram" }));
+    }
+
     if (!url) {
       return c.json(errorRes(type === "serverchan" ? "请先填写 SendKey" : "请先填写 Webhook 地址", "bad_request"), 400);
     }

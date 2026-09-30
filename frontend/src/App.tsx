@@ -466,7 +466,7 @@ const CF_COL_CLASS: Record<string, string> = {
 };
 
 const OVERVIEW_COL_OPTIONS = [
-  { value: "auto", label: "自动（推荐）" },
+  { value: "auto", label: "自动" },
   { value: "2", label: "2 列" },
   { value: "3", label: "3 列" },
   { value: "4", label: "4 列" },
@@ -654,7 +654,8 @@ export default function App() {
   }
   const [settings, setSettings] = useState<AppSettings>({
     webhook_url: "",
-    webhook_type: "custom",
+    /* 默认渠道 = 邮箱（SMTP）（用户 2026-09-30 定）。库里已存过值时由 /api/settings 覆盖。 */
+    webhook_type: "email",
     tg_token: "",
     tg_chat_id: "",
     renew_threshold_days: "180",
@@ -2469,30 +2470,6 @@ export default function App() {
     }
   };
 
-  // 测试 Telegram 推送
-  const handleTestTelegram = async () => {
-    setActionLoading("test-tg");
-    try {
-      const payload: Record<string, string> = { tg_chat_id: settings.tg_chat_id };
-      if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
-      const res = await apiFetch("/api/settings/test-telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (data.success) {
-        showToast("success", data.message || "测试消息已发送");
-      } else {
-        showToast("error", data.message || "测试推送失败");
-      }
-    } catch (e) {
-      showToast("error", "测试推送网络请求失败");
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
   // 测试 Webhook 推送
   const handleTestWebhook = async () => {
     setActionLoading("test-webhook");
@@ -2510,6 +2487,11 @@ export default function App() {
         payload.smtp_from = settings.smtp_from;
         payload.smtp_to = settings.smtp_to;
         if (settings.smtp_pass && !settings.smtp_pass.startsWith("****")) payload.smtp_pass = settings.smtp_pass;
+      }
+      // Telegram 渠道：同样把 Token / Chat ID 送去（可能是刚填、还没保存的值）
+      if (settings.webhook_type === "telegram") {
+        if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
+        payload.tg_chat_id = settings.tg_chat_id;
       }
       const res = await apiFetch("/api/settings/test-webhook", {
         method: "POST",
@@ -6789,8 +6771,11 @@ export default function App() {
                     <Globe className="w-4 h-4 text-indigo-400" />
                     <h3 className="font-bold text-content-primary text-sm">域名列表（未永久域名可生成助力码）</h3>
                   </div>
-                  {/* 三态筛选 */}
-                  <div className="flex items-center gap-1 p-0.5 rounded-lg bg-surface-hover border border-border-soft flex-shrink-0">
+                  {/* 三态筛选
+                      NOTE: 原来是 `flex ... flex-shrink-0` —— 窄屏父容器 flex-col 会把它拉满整行，
+                      而按钮按内容宽度排，于是整体靠左、右侧一片空白（用户 2026-09-30 指出）。
+                      改 grid-cols-3：窄屏三等分撑满；≥sm 容器宽度回到 auto，自动收缩成紧凑药丸组。 */}
+                  <div className="grid grid-cols-3 gap-1 p-0.5 rounded-lg bg-surface-hover border border-border-soft sm:w-auto">
                     {([
                       { k: "all", label: "全部" },
                       { k: "eligible", label: "未永久域名" },
@@ -8155,7 +8140,7 @@ export default function App() {
                       className="justify-center w-full md:w-auto bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm px-6 py-3 rounded-xl transition-all shadow-lg flex items-center gap-2 disabled:opacity-50"
                     >
                       <Play className={`w-4 h-4 flex-shrink-0 ${scanStatus === "running" ? "animate-spin" : ""}`} />
-                      {scanStatus === "running" ? "正在查重中..." : scanStatus === "paused" ? "恢复查询" : "开始生成查询"}
+                      {scanStatus === "running" ? "正在查重中..." : scanStatus === "paused" ? "恢复查询" : "开始查询"}
                     </button>
 
                     <button
@@ -8191,7 +8176,7 @@ export default function App() {
                       className="justify-center w-full md:w-auto md:ml-auto bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm px-5 py-3 rounded-xl transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Download className="w-4 h-4 flex-shrink-0" />
-                      导出 txt 字典文件 ({availableDomainsList.length})
+                      导出为 txt
                     </button>
                   </div>
                 </div>
@@ -8330,10 +8315,10 @@ export default function App() {
                     }}
                     className="form-input px-3 h-10 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[180px]"
                   >
-                    <option value="all">全部账号 (按账号独立分组)</option>
+                    <option value="all">全部账号</option>
                     {dnsheAccounts.map((acc) => (
                       <option key={acc.id} value={String(acc.id)}>
-                        账号: {acc.alias}
+                        {acc.alias}
                       </option>
                     ))}
                   </select>
@@ -8384,12 +8369,12 @@ export default function App() {
                     {collapsedAccounts.size > 0 ? (
                       <>
                         <ChevronsUpDown className="w-3.5 h-3.5" />
-                        展开全部
+                        展开
                       </>
                     ) : (
                       <>
                         <ChevronsDownUp className="w-3.5 h-3.5" />
-                        收起全部
+                        收起
                       </>
                     )}
                   </button>
@@ -8452,9 +8437,11 @@ export default function App() {
                           )}
                           <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
                         </h3>
-                        {/* 统计徽章独立于标题、贴卡片右缘（§12 对齐：元信息靠右）
-                            ml-auto：窄屏 flex-wrap 折到第二行时仍被推到最右侧 */}
-                        <span className="ml-auto text-[11px] md:text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal whitespace-nowrap">
+                        {/* 统计徽章：窄屏折到第二行并**撑满整行**（用户 2026-09-30 指出：
+                            只靠 ml-auto 挤在右侧、宽度随内容长短变化，移动端看着很别扭）。
+                            ≥md 恢复「贴卡片右缘」的小药丸形态（§12 元信息靠右）。
+                            仍保留 whitespace-nowrap：它属于 §15 标准档（22px），一旦折行就会变高破坏两档规格。 */}
+                        <span className="w-full md:w-auto md:ml-auto text-center md:text-left text-[11px] md:text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal whitespace-nowrap">
                           共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
                         </span>
                       </button>
@@ -8518,10 +8505,10 @@ export default function App() {
                     }}
                     className="form-input px-3 h-10 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[180px]"
                   >
-                    <option value="all">全部 Cloudflare 账号</option>
+                    <option value="all">全部账号</option>
                     {cfAccountList.map((acc) => (
                       <option key={acc.id} value={String(acc.id)}>
-                        账号: {acc.alias}
+                        {acc.alias}
                       </option>
                     ))}
                   </select>
@@ -8530,12 +8517,20 @@ export default function App() {
                   已绑定账号: <span className="text-indigo-400 font-bold">{cfAccountList.length}</span> |
                   托管 zones: <span className="text-emerald-400 font-bold">{cfZones.length}</span> 个
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-content-muted whitespace-nowrap">每行列数</span>
+              </div>
+
+              {/* 工具行：列数选择 + 同步 + 收起/展开 —— 三者同排（§14 均分规则）
+                  窄屏 grid-cols-3 三等分；≥sm 恢复按内容宽度排列并靠右。
+                  没有 zone 时不渲染「收起/展开」，此时降为 2 等分，避免空出一格。
+                  NOTE: 同步按钮原来是 `py-2 text-xs`（28~32px），和同行 h-10 的控件不等高 ——
+                  同排必须同档，见 §13 / §20。 */}
+              <div className={`grid ${cfZones.length > 0 ? "grid-cols-3" : "grid-cols-2"} sm:flex sm:flex-wrap sm:items-center gap-2 w-full md:w-auto md:justify-end`}>
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-xs text-content-muted whitespace-nowrap hidden sm:inline">每行列数</span>
                   <select
                     value={cfCols}
                     onChange={(e) => setCfCols(e.target.value)}
-                    className="form-input text-sm px-3 h-10 rounded-lg"
+                    className="form-input text-sm px-3 h-10 rounded-lg w-full sm:w-auto min-w-0"
                     aria-label="Cloudflare 卡片每行列数"
                   >
                     {OVERVIEW_COL_OPTIONS.map((o) => (
@@ -8543,35 +8538,28 @@ export default function App() {
                     ))}
                   </select>
                 </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
                 <button
                   onClick={handleCfSyncZones}
                   disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}
-                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="h-10 px-3 text-sm font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center justify-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {actionLoading === "cf-sync" ? (
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  )}
-                  同步 zones
+                  <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${actionLoading === "cf-sync" ? "animate-spin" : ""}`} />
+                  同步
                 </button>
                 {cfZones.length > 0 && (
                   <button
                     onClick={cfToggleAllAccounts}
-                    className="px-3 h-10 text-sm font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"
+                    className="h-10 px-3 text-sm font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center justify-center gap-1.5 whitespace-nowrap"
                   >
                     {cfCollapsedAccounts.size > 0 ? (
                       <>
-                        <ChevronsUpDown className="w-3.5 h-3.5" />
-                        展开全部
+                        <ChevronsUpDown className="w-3.5 h-3.5 shrink-0" />
+                        展开
                       </>
                     ) : (
                       <>
-                        <ChevronsDownUp className="w-3.5 h-3.5" />
-                        收起全部
+                        <ChevronsDownUp className="w-3.5 h-3.5 shrink-0" />
+                        收起
                       </>
                     )}
                   </button>
@@ -8701,14 +8689,14 @@ export default function App() {
                 <div className="flex gap-2 pt-1">
                   <button
                     onClick={() => setCfEditingAccount(null)}
-                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                    className="flex-1 h-10 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-2.5 sm:px-4 rounded-lg text-sm whitespace-nowrap"
                   >
                     取消
                   </button>
                   <button
                     onClick={handleCfUpdateAccount}
                     disabled={actionLoading === `cf-update-account-${cfEditingAccount.id}`}
-                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                    className="flex-1 h-10 btn-primary px-2.5 sm:px-4 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 whitespace-nowrap disabled:opacity-50"
                   >
                     {actionLoading === `cf-update-account-${cfEditingAccount.id}` ? (
                       <RefreshCw className="w-4 h-4 animate-spin" />
@@ -9569,14 +9557,14 @@ export default function App() {
                 <div className="flex gap-2 pt-1">
                   <button
                     onClick={() => setEditingAccount(null)}
-                    className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                    className="flex-1 h-10 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-2.5 sm:px-4 rounded-lg text-sm whitespace-nowrap"
                   >
                     取消
                   </button>
                   <button
                     onClick={handleUpdateAccount}
                     disabled={actionLoading === `update-account-${editingAccount.id}`}
-                    className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                    className="flex-1 h-10 btn-primary px-2.5 sm:px-4 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 whitespace-nowrap disabled:opacity-50"
                   >
                     {actionLoading === `update-account-${editingAccount.id}` ? (
                       <RefreshCw className="w-4 h-4 animate-spin" />
@@ -9715,20 +9703,20 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setBindModalOpen(false)}
-                        className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                        className="flex-1 h-10 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-2.5 sm:px-4 rounded-lg text-sm whitespace-nowrap"
                       >
                         取消
                       </button>
                       <button
                         type="submit"
                         disabled={actionLoading === "add-account"}
-                        className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                        className="flex-1 h-10 btn-primary px-2.5 sm:px-4 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 whitespace-nowrap disabled:opacity-50"
                       >
                         {actionLoading === "add-account" ? (
                           <RefreshCw className="w-4 h-4 animate-spin" />
                         ) : (
                           <>
-                            <Plus className="w-4 h-4" /> 验证并绑定账号
+                            <Plus className="w-4 h-4" /> 绑定账号
                           </>
                         )}
                       </button>
@@ -9838,20 +9826,20 @@ export default function App() {
                     <div className="flex gap-2 pt-1">
                       <button
                         onClick={() => setBindModalOpen(false)}
-                        className="flex-1 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm"
+                        className="flex-1 h-10 bg-elevated hover:bg-hovered text-content-muted border border-border-base px-2.5 sm:px-4 rounded-lg text-sm whitespace-nowrap"
                       >
                         取消
                       </button>
                       <button
                         onClick={handleCfAddAccount}
                         disabled={actionLoading === "cf-add-account"}
-                        className="flex-1 btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 disabled:opacity-50"
+                        className="flex-1 h-10 btn-primary px-2.5 sm:px-4 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-1.5 whitespace-nowrap disabled:opacity-50"
                       >
                         {actionLoading === "cf-add-account" ? (
                           <RefreshCw className="w-4 h-4 animate-spin" />
                         ) : (
                           <>
-                            <Cloud className="w-4 h-4" /> 验证并绑定账号
+                            <Cloud className="w-4 h-4" /> 绑定账号
                           </>
                         )}
                       </button>
@@ -10038,8 +10026,12 @@ export default function App() {
                 <p className="text-content-muted">没有查到配额数据。请确保至少绑定了一个账户，并且密钥配置无误。</p>
               </div>
             ) : (
-              /* 手机端仍 2 列（配额卡信息量小）；宽屏自适应到 4 列 —— 原来锁死 lg:grid-cols-3 */
-              <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-6">
+              /* 自适应 1→4 列（用户 2026-09-30 要求）：极窄屏（<360px）1 列。
+                 为什么必须降到 1 列：2 列时卡片仅 122px，底部「可用/已用/总配额」
+                 三列每列约 24px，而「总配额」需要 33px，实测溢出 9px（280px）／2px（320px）。
+                 手机 2 列、桌面 3～4 列。四档全用 min-[...] 任意变体，避免与命名断点(sm/lg/xl)
+                 混用时被 Tailwind 的排序压回。 */
+              <div className="grid grid-cols-1 min-[360px]:grid-cols-2 min-[1024px]:grid-cols-3 min-[1280px]:grid-cols-4 gap-3 sm:gap-6">
                 {filteredQuotas.map((q, idx) => {
                   if (q.error) {
                     return (
@@ -10064,9 +10056,12 @@ export default function App() {
 
                       {/* 环形/条形进度展示 */}
                       <div className="space-y-3">
-                        <div className="flex justify-between text-xs text-content-muted">
-                          <span>已用子域名: {q.used} / {q.total}</span>
-                          <span>{percent}%</span>
+                        {/* NOTE: 原来写「已用子域名: 16 / 16」，手机 2 列时这一行放不下会折成两行
+                            （用户 2026-09-30 指出）——「子域名」三字是多余的（页面就叫域名配额），
+                            去掉后连同空格收窄约 40px，390px 下稳定单行。两侧都加 nowrap 兜底。 */}
+                        <div className="flex justify-between items-baseline gap-2 text-xs text-content-muted">
+                          <span className="whitespace-nowrap">已用域名: {q.used}/{q.total}</span>
+                          <span className="whitespace-nowrap flex-shrink-0">{percent}%</span>
                         </div>
                         <div className="w-full bg-elevated h-2 rounded-full overflow-hidden">
                           <div 
@@ -10084,17 +10079,17 @@ export default function App() {
                             三个数里有两个永远一样 —— 显示出来只会让人怀疑算错。
                             改成真正有信息量的「可用 / 已用 / 总」。 */}
                         <div>
-                          <span className="block text-[11px] text-content-muted">可用配额</span>
+                          <span className="block text-[11px] text-content-muted whitespace-nowrap">可用</span>
                           <span className={`text-sm font-semibold ${q.available <= 0 ? "text-red-400" : "text-emerald-400"}`}>
                             {q.available}
                           </span>
                         </div>
                         <div>
-                          <span className="block text-[11px] text-content-muted">已用配额</span>
+                          <span className="block text-[11px] text-content-muted whitespace-nowrap">已用</span>
                           <span className="text-sm font-semibold text-amber-400">{q.used}</span>
                         </div>
                         <div>
-                          <span className="block text-[11px] text-content-muted">总配额</span>
+                          <span className="block text-[11px] text-content-muted whitespace-nowrap">总配额</span>
                           <span className="text-sm font-semibold text-content-primary">{q.total}</span>
                         </div>
                       </div>
@@ -10120,8 +10115,12 @@ export default function App() {
               </button>
             </div>
 
-            {/* 日志分类子标签 */}
-            <div className="flex gap-2 flex-wrap">
+            {/* 日志分类子标签
+                §14 均分规则：窄屏一行四等分撑满（390px 实测每格 85.5px，内容 66px，放得下）；
+                ≥sm 回到按内容宽度的紧凑排列（四个小筛选块拉满整行反而难看）。
+                NOTE: 原来是 `flex flex-wrap` + `py-2` —— 手机上随缘折成 3+1，
+                且 36px 高不达 §9 的 40px 触控下限。 */}
+            <div className="grid grid-cols-4 gap-2 sm:flex sm:w-fit">
               {([
                 { key: "all", label: "全部", icon: <ScrollText className="w-4 h-4" /> },
                 { key: "auth", label: "登录", icon: <LogIn className="w-4 h-4" /> },
@@ -10131,7 +10130,7 @@ export default function App() {
                 <button
                   key={t.key}
                   onClick={() => setLogCategory(t.key)}
-                  className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-semibold transition-all ${
+                  className={`flex items-center justify-center gap-1.5 px-2 sm:px-4 h-10 rounded-lg text-sm font-semibold whitespace-nowrap transition-all ${
                     logCategory === t.key
                       ? "bg-indigo-600 text-white"
                       : "bg-elevated text-content-muted hover:text-content-primary hover:bg-hovered border border-border-base"
@@ -10609,51 +10608,27 @@ export default function App() {
                     <Bell className="w-4 h-4 text-amber-400" /> 通知渠道
                   </h3>
 
-                  {/* Telegram */}
+                  {/* 渠道选择：Telegram 已于 2026-09-30 并入这里。
+                      原来 Telegram 是独立一块，而且后端**无条件**补发一份 —— 选「邮箱」也会收到 TG 消息，
+                      界面上却看不出来。现在「选哪个就发哪个」，默认邮箱。 */}
                   <div className="space-y-3">
-                    <div className="text-sm font-semibold text-content-primary flex items-center gap-1.5">
-                      <Send className="w-4 h-4 text-sky-400" /> Telegram
-                    </div>
-                    <input
-                      value={settings.tg_token}
-                      onChange={(e) => setSettings((s) => ({ ...s, tg_token: e.target.value }))}
-                      placeholder={settingsConfigured.tg_token ? "已配置（留空不修改）" : "Bot Token"}
-                      className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
-                    />
-                    <div className="flex flex-col sm:flex-row gap-2">
-                      <input
-                        value={settings.tg_chat_id}
-                        onChange={(e) => setSettings((s) => ({ ...s, tg_chat_id: e.target.value }))}
-                        placeholder="Chat ID"
-                        className="form-input flex-1 px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
-                      />
-                      <button
-                        onClick={handleTestTelegram}
-                        disabled={actionLoading === "test-tg"}
-                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50 flex-shrink-0"
-                      >
-                        <Send className="w-4 h-4" /> 测试推送
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* 通知渠道：Webhook 或 邮箱(SMTP) */}
-                  <div className="space-y-3 pt-3 border-t border-border-soft">
                     <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                      <div className="text-sm font-semibold text-content-primary">
-                        {settings.webhook_type === "email" ? "邮箱 (SMTP)" : "Webhook"}
-                      </div>
+                      <label htmlFor="notify-channel" className="text-sm font-semibold text-content-primary">
+                        渠道选择
+                      </label>
                       <select
+                        id="notify-channel"
                         value={settings.webhook_type}
                         onChange={(e) => setSettings((s) => ({ ...s, webhook_type: e.target.value }))}
                         className="form-input w-full sm:w-56 px-3 h-10 rounded-lg text-sm text-content-primary"
                       >
+                        <option value="email">邮箱 (SMTP)</option>
+                        <option value="telegram">Telegram</option>
                         <option value="custom">通用 (custom)</option>
                         <option value="dingtalk">钉钉 (dingtalk)</option>
                         <option value="feishu">飞书 (feishu)</option>
                         <option value="wecom">企业微信 (wecom)</option>
                         <option value="serverchan">Server酱 · 方糖 (serverchan)</option>
-                        <option value="email">邮箱 (SMTP)</option>
                       </select>
                     </div>
 
@@ -10715,6 +10690,21 @@ export default function App() {
                           />
                         </div>
                       </div>
+                    ) : settings.webhook_type === "telegram" ? (
+                      <div className="space-y-3">
+                        <input
+                          value={settings.tg_token}
+                          onChange={(e) => setSettings((s) => ({ ...s, tg_token: e.target.value }))}
+                          placeholder={settingsConfigured.tg_token ? "已配置（留空不修改）" : "Bot Token"}
+                          className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                        />
+                        <input
+                          value={settings.tg_chat_id}
+                          onChange={(e) => setSettings((s) => ({ ...s, tg_chat_id: e.target.value }))}
+                          placeholder="Chat ID"
+                          className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                        />
+                      </div>
                     ) : (
                       <input
                         value={settings.webhook_url}
@@ -10746,6 +10736,12 @@ export default function App() {
                           QQ 邮箱请先到「设置 → 账户 → POP3/IMAP/SMTP 服务」开启服务并生成<b>授权码</b>，
                           把它填进上面的「授权码」（<b>不是</b>邮箱登录密码）；端口填 465。
                           发信走 Cloudflare 的 TLS 长连接，若一直超时，说明该服务商屏蔽了 Cloudflare 出口 IP，可改用 Webhook。
+                        </>
+                      ) : settings.webhook_type === "telegram" ? (
+                        <>
+                          在 Telegram 里找 <b>@BotFather</b> 创建机器人拿到 Bot Token；Chat ID 可用
+                          <b> @userinfobot</b> 查询自己的，群聊的 ID 是负数（把机器人拉进群后发条消息，
+                          访问 <code className="font-mono">getUpdates</code> 即可看到）。
                         </>
                       ) : settings.webhook_type === "serverchan" ? (
                         <>
