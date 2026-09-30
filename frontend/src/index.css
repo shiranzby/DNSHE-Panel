@@ -308,5 +308,9 @@
   .nav-sublist {
     transition: none;
   }
+  /* 手机端顶部下拉抽屉的滑出过渡 */
+  #app-nav-panel {
+    transition: none;
+  }
 }
 

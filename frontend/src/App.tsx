@@ -6111,31 +6111,41 @@ export default function App() {
     <div className="flex h-[100dvh] overflow-hidden bg-page text-content-primary">
 
       {/* 手机抽屉遮罩：点击关闭；≥md 侧栏常驻，不需要遮罩 */}
+      {/*
+        NOTE: 遮罩从**顶栏下沿**开始（top-16），不能 inset-0 —— 否则它会把顶栏一起盖住，
+        汉堡按钮就被压在遮罩底下、点不到，也就无法"再点一次收起"。
+      */}
       {sidebarOpen && (
         <div
           onClick={() => setSidebarOpen(false)}
-          className="fixed inset-0 z-30 bg-slate-950/60 backdrop-blur-sm md:hidden"
+          className="fixed left-0 right-0 bottom-0 top-16 z-30 bg-slate-950/60 backdrop-blur-sm md:hidden"
           aria-hidden="true"
         />
       )}
 
-      {/* ===== 左侧菜单：<md 为抽屉，≥md 为常驻可折叠侧栏 ===== */}
+      {/* ===== 导航：<md 为顶栏下拉抽屉，≥md 为常驻可折叠侧栏 ===== */}
       {/*
         NOTE: 同一个 aside 兼任两种形态，导航项只写一份。
-        <md：fixed 定位 + translate-x 滑入滑出，不占布局流（否则会吃掉 224px 中的一半屏宽）；
-        ≥md：md:static 归位到布局流，宽度由 railMode 决定，与改造前完全一致。
-        根容器是 h-[100dvh] overflow-hidden、页面本身不滚动（滚动在 main 内部），
-        且抽屉是 fixed，所以不需要额外锁 body 滚动。
+        <md：fixed 顶栏下沿通栏（top-16 left-0 right-0），用 translate-y 从上方滑出
+             （-translate-y-full → 0）；底部再留一段空隙，让它一眼是"下拉的抽屉"
+             而不是整屏页面。**顶栏本身不被遮住** —— 汉堡要在展开态变成 × 并能点回来。
+             不占布局流，否则会吃掉手机上一半屏宽。
+        ≥md：md:static 归位到布局流（static 会忽略 top/left/right），宽度由 railMode 决定，
+             并且**必须显式 md:translate-y-0** —— 手机态留下的 -translate-y-full
+             在切到桌面宽度后依然生效，会把常驻侧栏整个顶出屏幕外。
+        2026-09-30 第17轮：用户要求「点击打开菜单的按钮…我要的是从上面下拉出来的抽屉形式」，
+        原来的左侧滑入式 aside 保留给 ≥md 的常驻侧栏，<md 换成顶部下拉。
       */}
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-64 flex flex-col border-r border-border-base bg-surface transition-transform duration-300 ${
-          sidebarOpen ? "translate-x-0" : "-translate-x-full"
-        } md:static md:z-auto md:translate-x-0 md:flex-shrink-0 md:transition-all ${
+        id="app-nav-panel"
+        className={`fixed top-16 left-0 right-0 z-40 w-full max-h-[calc(100dvh-8rem)] flex flex-col overflow-hidden rounded-b-2xl shadow-2xl border-b border-border-base bg-surface transition-transform duration-300 ease-out ${
+          sidebarOpen ? "translate-y-0" : "-translate-y-[calc(100%_+_4rem)]"
+        } md:static md:z-auto md:translate-y-0 md:max-h-none md:rounded-none md:shadow-none md:border-b-0 md:border-r md:flex-shrink-0 md:transition-all ${
           railMode ? "md:w-16" : "md:w-56"
         }`}
       >
-        {/* LOGO + 折叠按钮 */}
-        <div className="h-16 flex items-center gap-2 px-3 border-b border-border-base">
+        {/* LOGO + 折叠按钮（≥md 侧栏头部；手机下拉抽屉里不重复顶栏已有的信息与关闭方式） */}
+        <div className="hidden md:flex h-16 items-center gap-2 px-3 border-b border-border-base">
           {/* 折叠切换只在桌面有意义：手机上这个按钮所在的抽屉本身就是被汉堡唤出的 */}
           <button
             onClick={() => setSidebarCollapsed((v) => !v)}
@@ -6150,18 +6160,15 @@ export default function App() {
               <span className="truncate">DNSHE 集控</span>
             </div>
           )}
-          {/* 抽屉关闭按钮（仅手机） */}
-          <button
-            onClick={() => setSidebarOpen(false)}
-            className="md:hidden ml-auto p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all"
-            title="关闭菜单"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          {/*
+            原来这里有个「手机端抽屉 × 关闭按钮」。第17轮抽屉改到顶栏下沿之后，
+            顶栏的汉堡在展开态自己就变成 × 且始终可见可点，遮罩与 Esc 也都还在（§22），
+            这个按钮成了永远不会渲染的死代码（父行 md:flex、自己 md:hidden）⇒ 删掉。
+          */}
         </div>
 
         {/* 菜单项 */}
-        <nav className="flex-1 py-4 px-2 space-y-1 overflow-y-auto">
+        <nav className="flex-1 py-4 px-2 space-y-1 overflow-y-auto overscroll-contain">
           {navItems.map((item) => {
             /*
               二级菜单：目前只有「设置」有下级小节（后端地址 / 账户安全 / 自动续期 /
@@ -6180,7 +6187,7 @@ export default function App() {
                       setSidebarOpen(false);
                     }}
                     title={railMode ? item.label : undefined}
-                    className={`group flex-1 min-w-0 flex items-center gap-3 px-3 py-3 md:py-2.5 rounded-lg text-sm font-semibold transition-all ${
+                    className={`group flex-1 min-w-0 flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-semibold transition-all ${
                       activeTab === item.key
                         ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
                         : "text-content-muted hover:text-content-primary hover:bg-hovered"
@@ -6318,6 +6325,8 @@ export default function App() {
               onClick={() => {
                 const next = !notifOpen;
                 setNotifOpen(next);
+                // 通知面板与新抽屉都占「顶栏下沿」这一块，两者不同时开（§10.5 互斥只留一个）
+                if (next) setSidebarOpen(false);
                 if (next) markAlertsRead();
               }}
               className="relative h-10 w-10 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex items-center justify-center"
@@ -6398,11 +6407,18 @@ export default function App() {
                位置按用户要求移，尺寸仍按规范：这是同一件事的两个维度，不冲突。
           */}
           <button
-            onClick={() => setSidebarOpen(true)}
+            onClick={() => {
+              const next = !sidebarOpen;
+              setSidebarOpen(next);
+              // 同上：两个顶栏下沿浮层互斥
+              if (next) setNotifOpen(false);
+            }}
             className="md:hidden h-10 w-10 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
-            title="打开菜单"
+            title={sidebarOpen ? "关闭菜单" : "打开菜单"}
+            aria-expanded={sidebarOpen}
+            aria-controls="app-nav-panel"
           >
-            <Menu className="w-5 h-5" />
+            {sidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
           </button>
 
           {/* 退出登录：手机上头部空间紧张，入口挪进抽屉底部 */}
@@ -10694,9 +10710,20 @@ export default function App() {
                             <p className="text-[11px] text-content-muted">
                               无法扫码时，可在验证器中手动录入以下密钥：
                             </p>
-                            <div className="font-mono text-sm bg-surface border border-border-base rounded-lg px-3 py-2 break-all text-indigo-400 select-all text-center tracking-wider">
+                            {/*
+                              NOTE: 密钥块改为**点击即可复制**（2026-09-30 第17轮用户要求）。
+                              外观与改造前完全一致（自动高度 + py-2 + break-all，长密钥允许折行），
+                              只补上 cursor-pointer / hover 边框高亮 / 点击态，让"可点"这件事看得出来。
+                              ⚠️ 不能用 h-10 固定高度：32 位密钥在 280px 窄屏会折成两行，写死 40px 会被裁掉。
+                            */}
+                            <button
+                              type="button"
+                              onClick={() => copyToClipboard(twoFaSetup.secret, "2FA 密钥")}
+                              title="点击复制密钥"
+                              className="w-full font-mono text-sm bg-surface border border-border-base rounded-lg px-3 py-2 break-all text-indigo-400 select-all text-center tracking-wider cursor-pointer hover:border-indigo-400/60 hover:bg-hovered active:scale-[0.99] transition-all"
+                            >
                               {twoFaSetup.secret}
-                            </div>
+                            </button>
                             <p className="text-xs text-content-secondary">2. 输入验证器当前显示的 6 位动态码以完成开启：</p>
                             {/*
                               NOTE: 与「后端地址」同一套形状 —— 输入框第一行独占，动作按钮第二行两等分。
