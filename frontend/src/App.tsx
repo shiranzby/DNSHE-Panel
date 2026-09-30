@@ -6126,15 +6126,17 @@ export default function App() {
       {/* ===== 导航：<md 为顶栏下拉抽屉，≥md 为常驻可折叠侧栏 ===== */}
       {/*
         NOTE: 同一个 aside 兼任两种形态，导航项只写一份。
-        <md：fixed 顶栏下沿通栏（top-16 left-0 right-0），用 translate-y 从上方滑出
-             （-translate-y-full → 0）；底部再留一段空隙，让它一眼是"下拉的抽屉"
-             而不是整屏页面。**顶栏本身不被遮住** —— 汉堡要在展开态变成 × 并能点回来。
-             不占布局流，否则会吃掉手机上一半屏宽。
+        <md：fixed 顶栏下沿通栏（top-16 left-0 right-0），用 translate-y 从**顶栏底下**滑出
+             （-translate-y-[calc(100%_+_4rem)] → 0）。关键在于顶栏被抬到 z-[45]（见 <header> 的
+             NOTE）—— 抽屉途经 y<64 的那截被顶栏挡住，所以它看起来是从顶栏下沿"长"出来的，
+             而不是从屏幕最顶端掉下来。底部再留一段空隙，让它一眼是"下拉的抽屉"而不是整屏页面。
+             汉堡始终可见可点，展开态变成 × 能点回来。不占布局流，否则会吃掉手机上一半屏宽。
         ≥md：md:static 归位到布局流（static 会忽略 top/left/right），宽度由 railMode 决定，
-             并且**必须显式 md:translate-y-0** —— 手机态留下的 -translate-y-full
+             并且**必须显式 md:translate-y-0** —— 手机态留下的负位移
              在切到桌面宽度后依然生效，会把常驻侧栏整个顶出屏幕外。
         2026-09-30 第17轮：用户要求「点击打开菜单的按钮…我要的是从上面下拉出来的抽屉形式」，
-        原来的左侧滑入式 aside 保留给 ≥md 的常驻侧栏，<md 换成顶部下拉。
+        原来的左侧滑入式 aside 保留给 ≥md 的常驻侧栏，<md 换成顶部下拉；
+        同轮后半段用户再提「应该从顶栏的下面边缘出来，低于按钮控件才对」⇒ 顶栏加 `relative z-[45]`。
       */}
       <aside
         id="app-nav-panel"
@@ -6271,7 +6273,20 @@ export default function App() {
       <div className="flex-1 flex flex-col overflow-hidden">
 
         {/* ===== 顶部栏 ===== */}
-        <header className="h-16 flex-shrink-0 flex items-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-6 border-b border-border-base bg-surface">
+        {/*
+          NOTE: `relative z-[45]` 是手机下拉抽屉能"从顶栏底下钻出来"的前提（第17轮补充）。
+          <md 时抽屉是 `fixed top-16 z-40`，而顶栏原本是 static（z 自动）—— 定位元素必然
+          画在非定位元素之上，于是抽屉在滑出/收回的途中会把顶栏整条盖住，看着就像
+          "从屏幕最顶端掉下来"（用户实拍反馈：「完全从顶部出来…应该从顶栏的下面边缘出来」）。
+          把顶栏提到 45 层：
+            · 45 > 40 ⇒ 抽屉位于 y<64 的那一截被顶栏遮住，只能从顶栏下沿"长"出来；
+            · 45 < 50 ⇒ 弹窗 / toast（z-50）依旧盖得住顶栏，层级语义不变。
+          顶栏背景是不透明的 `bg-surface`（亮 #ffffff / 暗 #0f151f）且无 backdrop-blur，
+          遮挡是实的，不会透出抽屉内容；`border-b` 也随顶栏一起压在抽屉之上。
+          ⚠️ 已确认的副作用：顶栏成为层叠上下文后，它内部的「告警通知」面板
+          （`fixed ... z-50`）实际被抬到根层的 45 —— 而它本来就该在弹窗之下、内容之上。
+        */}
+        <header className="relative z-[45] h-16 flex-shrink-0 flex items-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-6 border-b border-border-base bg-surface">
           {/* 全局搜索框 */}
           {/*
             NOTE: min-w-0 是必需的 —— flex 子项默认 min-width:auto，没有它 flex-1 不会真的收缩。
