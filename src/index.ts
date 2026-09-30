@@ -2709,10 +2709,26 @@ app.get("/api/keys", async (c) => {
   const raw = c.req.query("account_id") || "";
   const wantAll = raw === "" || raw === "all";
   const accountId = wantAll ? NaN : parseInt(raw, 10);
+  // source=local ⇒ 只读本地库登记的快照，一个上游请求都不发（1 次 D1 查询/账号）。
+  // 用途：打开页面时先把上次刷新记录下来的清单立刻铺上去，再后台补实时状态，避免整屏转圈。
+  const localOnly = c.req.query("source") === "local";
 
   if (!wantAll && !Number.isFinite(accountId)) {
     return c.json(errorRes("account_id 参数不合法", "bad_request"), 400);
   }
+
+  /** 只读本地登记（0 次上游请求）。字段与上游视图对齐，status/request_count 可能过期。 */
+  const collectLocal = async (id: number) =>
+    (await dbManager.listStoredApiKeys(id)).map((k) => ({
+      key_id: k.keyId,
+      key_name: k.keyName,
+      api_key: k.apiKey,
+      status: k.status,
+      request_count: k.requestCount,
+      last_used_at: k.lastUsedAt,
+      remote_created_at: k.remoteCreatedAt,
+      has_secret: k.hasSecret,
+    }));
 
   /** 拉取并合并单个账号的密钥（上游实时状态 + 本地 Secret 登记） */
   const collect = async (id: number) => {
@@ -2721,8 +2737,28 @@ app.get("/api/keys", async (c) => {
     const localByKey = new Map(local.map((k) => [k.apiKey, k]));
 
     const upstream = await client.listApiKeys();
+    const upstreamKeys: ApiKeyInfo[] = upstream.keys || [];
+
+    // 把上游这份清单登记进本地库：**不带 api_secret**，所以 upsert 只更新状态字段，
+    // 不会覆盖已保存的密文。有了它，下次打开页面时的 source=local 快照才是完整清单
+    // （否则库里只有「创建/重置过」的那几把，首屏会少密钥）。
+    for (const k of upstreamKeys) {
+      const name = String(k.key_name ?? "").trim();
+      if (!name || !k.api_key) continue;
+      await dbManager.upsertApiKey({
+        accountId: id,
+        keyId: k.id ?? null,
+        keyName: name,
+        apiKey: k.api_key,
+        status: k.status ?? null,
+        requestCount: k.request_count ?? null,
+        lastUsedAt: k.last_used_at ?? null,
+        remoteCreatedAt: k.created_at ?? null,
+      });
+    }
+
     // 显式标注元素类型：上游字段可能缺省为 null，与本地登记的 number|null 需共存
-    const merged: Array<Record<string, unknown>> = (upstream.keys || []).map((k: ApiKeyInfo) => {
+    const merged: Array<Record<string, unknown>> = upstreamKeys.map((k: ApiKeyInfo) => {
       const stored = localByKey.get(k.api_key);
       return {
         key_id: k.id,
@@ -2755,9 +2791,12 @@ app.get("/api/keys", async (c) => {
     return merged;
   };
 
+  // 取数口径：localOnly 走纯本地库快照，否则走上游实时
+  const pick = localOnly ? collectLocal : collect;
+
   try {
     if (!wantAll) {
-      return c.json(successRes({ keys: await collect(accountId) }));
+      return c.json(successRes({ keys: await pick(accountId) }));
     }
 
     // 全部账号视图：逐账号串行（上游有 30 次/分钟限流），单账号失败不影响其余
@@ -2765,7 +2804,7 @@ app.get("/api/keys", async (c) => {
     const groups: Array<{ account_id: number; alias: string; keys: Array<Record<string, unknown>>; error?: string }> = [];
     for (const acc of accounts) {
       try {
-        groups.push({ account_id: acc.id, alias: acc.alias, keys: await collect(acc.id) });
+        groups.push({ account_id: acc.id, alias: acc.alias, keys: await pick(acc.id) });
       } catch (e: unknown) {
         groups.push({
           account_id: acc.id,

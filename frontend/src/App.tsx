@@ -2188,6 +2188,41 @@ export default function App() {
   const keyIncrRunIdRef = useRef(0);
 
   /** 「全部账号」口径下的增量刷新：按账号串行重拉，每回来一个就替换对应分组 */
+  /**
+   * 只读服务端本地库快照（`source=local`，0 次上游请求）。
+   * 拿到就返回，拿不到返回 null —— 由调用方退回「整屏等待」。
+   */
+  const fetchKeySnapshot = async (v: "all" | number): Promise<ApiKeyGroup[] | ApiKeyRow[] | null> => {
+    try {
+      const res = await apiFetch(`/api/keys?account_id=${v === "all" ? "all" : v}&source=local`);
+      const data = await res.json();
+      if (!data.success) return null;
+      return v === "all" ? ((data.groups || []) as ApiKeyGroup[]) : ((data.keys || []) as ApiKeyRow[]);
+    } catch {
+      return null;
+    }
+  };
+
+  /** 单账号视图的后台补齐：只换数据，不转圈（首屏已经用快照铺过了） */
+  const refreshOneKeyList = async (v: number, reqId: number) => {
+    const runId = ++keyIncrRunIdRef.current;
+    setRefreshingApiKeys(true);
+    try {
+      const res = await apiFetch(`/api/keys?account_id=${v}`);
+      const data = await res.json();
+      if (apiKeyReqIdRef.current !== reqId) return;
+      if (data.success) {
+        const rows: ApiKeyRow[] = data.keys || [];
+        setApiKeys(rows);
+        apiKeyCacheRef.current.set(String(v), rows);
+      }
+    } catch {
+      /* 单个账号补齐失败不打断浏览，保留快照数据 */
+    } finally {
+      if (keyIncrRunIdRef.current === runId) setRefreshingApiKeys(false);
+    }
+  };
+
   const refreshKeyGroupsIncremental = async (base: ApiKeyGroup[], reqId: number) => {
     const runId = ++keyIncrRunIdRef.current;
     setRefreshingApiKeys(true);
@@ -2227,10 +2262,20 @@ export default function App() {
     const reqId = ++apiKeyReqIdRef.current;
     const cached = apiKeyCacheRef.current.get(cacheKey);
 
-    // 命中缓存且允许复用 → 先渲染旧数据，再后台补齐，全程不转圈
-    if (mode === "auto" && cached && cached.length >= 0) {
+    // force = 整页重拉，直接作废进行中的增量刷新并收掉它的徽章
+    if (mode === "force") {
+      keyIncrRunIdRef.current++;
+      setRefreshingApiKeys(false);
+    }
+
+    // 先拿「能立刻画出来的那一份」：内存缓存 → 服务端本地库快照（0 次上游请求）。
+    // 只要有一份就立刻铺上去、后台再补实时状态，全程不转圈；
+    // 两者都没有（首次部署、库里还没登记过）才退回整屏等待。
+    let base: ApiKeyGroup[] | ApiKeyRow[] | null | undefined = mode === "force" ? undefined : cached;
+    if (mode === "auto" && !base) base = await fetchKeySnapshot(v);
+    if (base) {
       if (v === "all") {
-        const groups = cached as ApiKeyGroup[];
+        const groups = base as ApiKeyGroup[];
         setApiKeyGroups(groups);
         setExpandedKeyAccounts((prev) =>
           prev.length ? prev : groups.filter((g) => (g.keys || []).length > 0).map((g) => g.account_id)
@@ -2239,16 +2284,11 @@ export default function App() {
         // 后台增量刷新（不 await，页面已经可用了）
         void refreshKeyGroupsIncremental(groups, reqId);
       } else {
-        setApiKeys(cached as ApiKeyRow[]);
+        setApiKeys(base as ApiKeyRow[]);
         setRevealedSecrets({});
+        void refreshOneKeyList(v, reqId);
       }
       return;
-    }
-
-    // force = 整页重拉，直接作废进行中的增量刷新并收掉它的徽章
-    if (mode === "force") {
-      keyIncrRunIdRef.current++;
-      setRefreshingApiKeys(false);
     }
 
     setLoadingApiKeys(true);

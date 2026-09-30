@@ -304,6 +304,45 @@ await it("markDomainRenewed() 更新到期时间与续期时间", async () => {
   assert.ok(row?.last_renewed_at);
 });
 
+await it("upsertApiKey() 不带 Secret 的列表同步不会抹掉已保存的密文", async () => {
+  // ① 创建 / 重置密钥时带 Secret 落库
+  await dbm.upsertApiKey({
+    accountId: 1, keyId: 7, keyName: "主密钥", apiKey: "k_alpha", apiSecret: "s_alpha", status: "active",
+  });
+  assert.equal(await dbm.revealApiKeySecret(1, "k_alpha"), "s_alpha");
+
+  // ② 列表同步（上游永远不回传 Secret）：只更新状态字段，密文必须原样保留。
+  //    这条是 `/api/keys` 每次刷新都把上游清单登记进库之后的**安全底线**。
+  await dbm.upsertApiKey({
+    accountId: 1, keyId: 7, keyName: "主密钥", apiKey: "k_alpha",
+    status: "disabled", requestCount: 42, lastUsedAt: "2026-09-30 10:00:00",
+  });
+  assert.equal(
+    await dbm.revealApiKeySecret(1, "k_alpha"), "s_alpha",
+    "不带 Secret 的同步把已保存的密文抹掉了"
+  );
+
+  const row = (await dbm.listStoredApiKeys(1)).find((r) => r.apiKey === "k_alpha");
+  assert.equal(row?.hasSecret, true, "hasSecret 被列表同步改成了 false");
+  assert.equal(row?.status, "disabled", "状态字段没被同步更新");
+  assert.equal(row?.requestCount, 42);
+
+  // ③ 只有真的带回新 Secret（重置）时才覆盖
+  await dbm.upsertApiKey({
+    accountId: 1, keyId: 7, keyName: "主密钥", apiKey: "k_alpha", apiSecret: "s_beta",
+  });
+  assert.equal(await dbm.revealApiKeySecret(1, "k_alpha"), "s_beta");
+
+  // ④ 上游新出现、本地从未持有的密钥：登记成一条，但 hasSecret 必须是 false ——
+  //    上游不会回传 Secret，不能假装本地有（否则「回显」按钮会去解密一个 null）
+  await dbm.upsertApiKey({
+    accountId: 1, keyId: 8, keyName: "历史密钥", apiKey: "k_beta", status: "active",
+  });
+  const beta = (await dbm.listStoredApiKeys(1)).find((r) => r.apiKey === "k_beta");
+  assert.equal(beta?.hasSecret, false, "本地没有密文时应标记 hasSecret=false");
+  assert.equal(beta?.keyId, 8);
+});
+
 await it("deleteAccount() 依赖外键级联清掉 domains_cache", async () => {
   assert.ok((await dbm.getDomains()).length > 0);
   await dbm.deleteAccount(1);
