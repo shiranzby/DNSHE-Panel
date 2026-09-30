@@ -37,7 +37,7 @@ DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-ma
 - **配额感知的同步** — 单次调用受 Workers 免费版「50 个子请求」限制，同步按**域名**预算分批并把剩余部分交回前端续跑，不静默丢账号
 - **通知推送** — 钉钉 / 飞书 / 企业微信 / Server酱 / Telegram / 自定义 Webhook / **邮箱 SMTP**
 - **安全认证** — 用户名 + 密码（PBKDF2 加盐哈希），可选 2FA (TOTP)；AES-GCM 加密存储 API Secret、API 密钥 Secret 与 2FA 密钥
-- **API 密钥页** — DNSHE 官方 API 密钥（key/secret）集中管理，Secret 加密保存、按需解密查看，支持批量创建与有效期展示
+- **API 密钥页** — DNSHE 官方 API 密钥（key/secret）集中管理，Secret 加密保存、按需解密查看，支持批量创建与有效期展示；**打开即出结果**：先读本地库快照（0 次上游请求），实时状态由后台逐账号补齐，全程不整屏转圈
 - **运行日志** — 分类（同步/续期/系统）与等级筛选，分页浏览
 - **主题与国际化域名** — 深色/浅色主题、刷新无闪白；Punycode 域名的中英互转与显示
 
@@ -321,6 +321,7 @@ Cloudflare Workers 免费版对**单次调用**有 50 个子请求的硬上限�
 | 手动全量同步 `POST /api/domains/sync` | **按域名预算分批**：`SYNC_SUBREQUEST_BUDGET = 34` 是「本次调用允许消耗的网络子请求数」，同步与续期共享同一份预算；被截断的域名回 `pending`、账号回 `remaining`，前端按 `done` 接力直到清空 | ≤ 34 |
 | 定时任务（Workers Cron / 自建版 node-cron） | 同一份预算，从持久化游标 `sync_cursor` 起**顺序尽量多扫**（不再是每轮只扫一个账号）；预算见底就把剩下的账号留给下一轮，游标正好停在断点 | ≤ 34 |
 | 解析线路的 NS 查询 `POST /api/dnshe/ns-lookup` | **限额 + 缓存**：单次最多查 20 个根域名（`NS_MAX_ROOTS = 20`，每个最坏 2 次子请求），结论缓存 30 天 | ≤ 40 |
+| **密钥页首屏** `GET /api/keys?source=local` | **先读本地库快照**：每次全量刷新都把上游密钥清单登记进 `api_keys` 表（登记时不带 Secret，不会覆盖已保存的密文）⇒ 打开页面直接读库出结果，一个上游请求都不发；实时状态（请求次数/最后使用）由前端在后台逐账号补齐 | **0 次上游请求**（只有 D1 查询） |
 
 线上实测（6 个 DNSHE 账号 + 1 个 Cloudflare 账号，共 50 个域名 / 29 个 zone）：
 
