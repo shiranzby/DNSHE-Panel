@@ -1,0 +1,12 @@
+node_modules/
+dist/
+# 自建版打包产物（`npm run build:node` 的输出，含测试 bundle，不入库）
+dist-node/
+# 前端构建产物（wrangler.toml 的 assets.directory，CI/本地各自构建）
+frontend/dist/
+.wrangler/
+*.log
+
+# 本地专用：前端设计规范与配套静态校验脚本（仅本机使用，不随仓库发布）
+docs/前端设计规范.md
+check-controls-static.mjs

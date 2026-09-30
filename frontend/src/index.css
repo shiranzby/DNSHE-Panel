@@ -1,0 +1,285 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * 主题配色变量 —— 语义化 CSS 变量，配合 tailwind.config.js 中的语义色使用。
+ * 亮色为默认 (:root)，暗色通过挂在 <html> 上的 .dark 类切换。
+ */
+:root {
+  --bg-base: #f1f5f9;      /* 页面最底层背景 */
+  --bg-surface: #ffffff;   /* 卡片/表格容器 */
+  --bg-elevated: #f8fafc;  /* 悬浮/表头/输入框 */
+  --bg-hover: #f1f5f9;     /* hover 态 */
+  --border-base: #e2e8f0;  /* 主边框 */
+  --border-soft: #eef2f7;  /* 更浅的分隔线 */
+  --text-primary: #0f172a; /* 主文字 */
+  --text-secondary: #334155;
+  --text-muted: #64748b;   /* 次要/说明文字 */
+  --accent: #6366f1;       /* 品牌强调色 */
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(15, 23, 42, 0.06);
+  --glass-shadow: 0 8px 32px 0 rgba(15, 23, 42, 0.08);
+  --input-bg: rgba(248, 250, 252, 0.9);
+  --input-border: rgba(15, 23, 42, 0.12);
+}
+
+.dark {
+  --bg-base: #090d14;
+  --bg-surface: #0f151f;
+  --bg-elevated: #1a2433;
+  --bg-hover: #1a2433;
+  --border-base: #1a2433;
+  --border-soft: #131b28;
+  --text-primary: #ffffff;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --accent: #6366f1;
+  --glass-bg: rgba(26, 36, 51, 0.6);
+  --glass-border: rgba(255, 255, 255, 0.05);
+  --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  --input-bg: rgba(15, 21, 31, 0.8);
+  --input-border: rgba(255, 255, 255, 0.1);
+}
+
+@layer base {
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    transition: background-color 0.3s ease, color 0.3s ease;
+    /* 阻止 iOS 横竖屏切换时自动放大字号，避免布局在横屏下走形 */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+}
+
+/*
+ * 触控设备适配
+ *
+ * NOTE: hover 态在触屏上是"点完粘住"的 —— 手指离开后 :hover 仍然生效，
+ * 于是卡片/按钮会停在位移后的位置，看起来像错位。这里只在没有真实悬停能力的
+ * 设备上取消位移（颜色与阴影保留，仍有按下反馈），桌面完全不受影响。
+ */
+@media (hover: none) {
+  .glass-card:hover,
+  .btn-primary:hover {
+    transform: none;
+  }
+}
+
+/* 去掉触屏点击时的蓝色高亮方块，改由各自的 hover/active 样式表达反馈 */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  a,
+  select,
+  [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* 细滚动条（长列表容器用，如批量扫描日志） */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-base) transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: var(--border-base);
+  border-radius: 3px;
+}
+
+/* 高端玻璃微卡特效 */
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  /* 仅过渡 transform/border/阴影，避免拖拽重排时逐帧触发全属性过渡导致卡顿 */
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.glass-card:hover {
+  border-color: rgba(99, 102, 241, 0.25);
+  box-shadow: 0 12px 40px 0 rgba(99, 102, 241, 0.1);
+  transform: translateY(-2px);
+}
+
+/* 霓虹按钮渐变 */
+.btn-primary {
+  background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+  transition: all 0.2s ease-in-out;
+}
+
+.btn-primary:hover {
+  background: linear-gradient(135deg, #818cf8 0%, #6366f1 100%);
+  box-shadow: 0 0 15px rgba(99, 102, 241, 0.5);
+  transform: translateY(-1px);
+}
+
+/* 表单框阴影 */
+.form-input {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-primary);
+  transition: all 0.2s ease;
+  /*
+   * 行高显式锁定：<select> 的 UA 默认 line-height 是 normal（约 1.2em），
+   * 而 <input> 是 20px —— 同一个 40px 高的框里，两种元素的文字视觉高度会不同。
+   * 本文件是不带 cascade layer 的样式，优先级高于 Tailwind utilities，
+   * 所以这一行能保证全站表单框的行高一致。
+   */
+  line-height: 1.25rem;
+}
+
+.form-input:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+  outline: none;
+}
+
+/*
+ * 窄屏下把输入框字号提到 16px
+ *
+ * NOTE: iOS Safari 在聚焦 font-size < 16px 的输入框时会强制放大整个页面
+ * （放大后不会自动还原，用户得手动缩回去）。调用处普遍是 text-sm / text-xs /
+ * text-[11px]，所以在这里统一兜底。断点与 Tailwind md 对齐：≥768px 仍用调用处
+ * 的紧凑字号，密集表单（如 DNS 记录表格的行内编辑）在桌面上的观感不变。
+ */
+@media (max-width: 767px) {
+  .form-input {
+    font-size: 16px;
+  }
+}
+
+/*
+ * 全局搜索框用的是 type="search"（为了不被 Chrome 密码管理器当成用户名字段
+ * 自动填充），这里隐藏 WebKit 的原生清除按钮，让外观与普通文本框保持一致。
+ */
+.form-input[type="search"]::-webkit-search-cancel-button,
+.form-input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* 闪烁圆点（表示同步中/状态好） */
+.pulse-green {
+  animation: pulse-green-anim 2s infinite;
+}
+
+@keyframes pulse-green-anim {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px rgba(34, 197, 94, 0);
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+  }
+}
+
+/* ── 主域新增：布局变化的过渡动画 ──
+ *
+ * NOTE: 网格列数（grid-template-columns）本身不可过渡 —— 靠它做「2 列 → 4 列」的动画
+ *       只会瞬间跳变。所以改成「重挂载 + 淡入上浮」：切换列数时给网格换 key，
+ *       React 重建子节点，动画自然重放，视觉上就是一次平滑的重排。
+ */
+@keyframes ov-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.ov-anim > * {
+  animation: ov-in 260ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+/* ⚠️ 这些入场动画一律用 backwards 而不是 both：
+   both 会在动画结束后永远挂着一个 transform（计算值是单位矩阵 ≠ none），
+   而任何祖先只要 transform ≠ none，就会成为 fixed 后代的包含块 ——
+   页面里所有的模态弹窗（fixed inset-0）都会因此被定位到滚动内容深处、屏幕上看不见。
+   2026-09-30 实测踩坑：助力确认弹窗自从加 page-anim 起就打不开了。 */
+/* 抽屉/面板的滑入（账号筛选抽屉、设置页瀑布流换列时复用） */
+@keyframes drawer-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.drawer-anim {
+  animation: drawer-in 220ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+/* 页面级：切换标签时旧块卸载、新块挂载，配合 key 变化重放一次淡入 */
+.page-anim {
+  animation: page-in 240ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/**
+ * 可折叠内容区的展开淡入
+ *
+ * NOTE: 真正的「高度 0 → 自动」过渡需要把内容常驻 DOM 并用 grid-rows:0fr→1fr 的技巧，
+ *       而这里的分组是「收起时不渲染」，改动量太大。所以只做展开淡入（收起仍是瞬时），
+ *       已经足够消除「展开时内容硬弹出来」的突兀感。
+ */
+.expand-anim {
+  animation: expand-in 240ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  transform-origin: top;
+}
+
+@keyframes expand-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 尊重系统的「减少动态效果」偏好 */
+@media (prefers-reduced-motion: reduce) {
+  .ov-anim > *,
+  .drawer-anim,
+  .page-anim,
+  .expand-anim {
+    animation: none;
+  }
+}
+

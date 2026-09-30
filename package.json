@@ -1,0 +1,29 @@
+{
+  "name": "dnshe-panel",
+  "version": "1.0.0",
+  "description": "DNSHE Multi-Account Domain Manager Cloudflare Worker",
+  "main": "src/index.ts",
+  "scripts": {
+    "clean:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/clean-local.ps1 -Force",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build:node": "esbuild server/index.ts --bundle --platform=node --target=node22 --format=esm --external:cloudflare:sockets --outfile=dist-node/server.mjs",
+    "start:node": "node dist-node/server.mjs",
+    "verify:node": "tsc --noEmit -p server",
+    "test:node": "esbuild server/d1-sqlite.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/d1-sqlite.test.mjs && node dist-node/d1-sqlite.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260828.1",
+    "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.4.3",
+    "wrangler": "^4.127.0"
+  }
+}

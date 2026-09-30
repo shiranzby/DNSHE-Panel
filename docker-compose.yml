@@ -1,0 +1,27 @@
+services:
+  dnshe-panel:
+    image: ghcr.io/shiranzby/dnshe-panel:latest # 镜像地址，大陆可换 ghcr.nju.edu.cn/shiranzby/dnshe-panel
+    container_name: dnshe-panel # 容器名称
+    restart: unless-stopped # 异常退出自动重启
+    ports:
+      - "8787:8787" # 面板端口，反代可改为 "127.0.0.1:8787:8787"
+    volumes:
+      - dnshe-data:/data # 数据库与加密密钥，务必备份
+    environment:
+      TZ: ${TZ:-Asia/Shanghai} # 容器日志时区
+
+      # 以下全部可选，留空即为不启用（详见 .env.example）
+      AES_KEY: ${AES_KEY:-} # AES-GCM 加密密钥，留空自动生成并保存到 /data/aes.key
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-} # 应急后门令牌，忘记密码时兜底登录
+      WEBHOOK_URL: ${WEBHOOK_URL:-} # 通知推送地址
+      WEBHOOK_TYPE: ${WEBHOOK_TYPE:-} # 通知类型：dingtalk / feishu / wecom / serverchan / custom
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-} # CORS 来源，自建同源无需配置
+      DEFAULT_API_KEY: ${DEFAULT_API_KEY:-} # 首次启动自动绑定的 DNSHE API Key
+      DEFAULT_API_SECRET: ${DEFAULT_API_SECRET:-} # 首次启动自动绑定的 DNSHE API Secret
+      DEFAULT_API_ALIAS: ${DEFAULT_API_ALIAS:-} # 默认账号别名
+      CRON_UTC_HOUR: ${CRON_UTC_HOUR:-2} # 定时任务执行时刻（UTC 时），默认 2 = 北京 10 点
+      CRON_UTC_MINUTE: ${CRON_UTC_MINUTE:-0} # 定时任务执行时刻（UTC 分）
+      DISABLE_CRON: ${DISABLE_CRON:-} # 设为 1 关闭每日自动同步与续期
+
+volumes:
+  dnshe-data: # 持久化数据卷

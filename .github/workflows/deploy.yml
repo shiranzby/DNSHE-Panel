@@ -1,0 +1,284 @@
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # wrangler 4 的 engines 要求 Node >= 22
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          npm ci
+          cd frontend && npm ci
+
+      - name: Setup & Bind Cloudflare D1 Database
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          # wrangler.toml 里的 database_id 可能是模板占位符，也可能是某个账号下的真实 ID。
+          # 这里统一「按名字查/建 -> 覆写 ID」，fork 之后不用手工改配置。
+          toml_get() {
+            grep -m1 -E "^[[:space:]]*$1[[:space:]]*=" wrangler.toml \
+              | sed -E 's/^[^=]*=[[:space:]]*"?([^"[:space:]]+)"?.*$/\1/'
+          }
+
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}"
+          DB_NAME=$(toml_get database_name)
+          DB_NAME="${DB_NAME:-dnshe-panel-db}"
+          CUR_ID=$(toml_get database_id)
+          DB_ID="${CLOUDFLARE_D1_DATABASE_ID}"
+
+          if [ -n "$DB_ID" ]; then
+            echo "✅ 使用 GitHub Secret 中配置的 CLOUDFLARE_D1_DATABASE_ID: $DB_ID"
+          else
+            echo "🔍 正在通过 Cloudflare REST API 自动查询 D1 数据库 [${DB_NAME}]..."
+
+            D1_LIST=$(curl -s -X GET "${API}/d1/database" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+
+            DB_ID=$(echo "$D1_LIST" | jq -r --arg n "$DB_NAME" '.result[]? | select(.name==$n) | .uuid' 2>/dev/null | head -n 1 || echo "")
+
+            if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
+              echo "⚡ 正在为您在 Cloudflare 自动一键创建 D1 数据库 [${DB_NAME}]..."
+              CREATE_RES=$(curl -s -X POST "${API}/d1/database" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\":\"${DB_NAME}\"}" || echo "{}")
+
+              DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // empty' 2>/dev/null || echo "")
+            fi
+          fi
+
+          if [ -n "$DB_ID" ] && [ "$DB_ID" != "null" ]; then
+            if [ -n "$CUR_ID" ] && [ "$CUR_ID" != "$DB_ID" ]; then
+              sed -i "s|${CUR_ID}|${DB_ID}|g" wrangler.toml
+            else
+              sed -i -E "s|^([[:space:]]*database_id[[:space:]]*=).*|\1 \"${DB_ID}\"|" wrangler.toml
+            fi
+            echo "🎉 成功将 D1 数据库 [${DB_NAME}] 的 ID [$DB_ID] 绑定写入 wrangler.toml"
+          else
+            echo "⚠️ 未能自动获取/创建 D1 数据库 ID，请检查 API Token 权限是否包含 [D1:编辑]"
+          fi
+
+      # KV 与 D1 同理：仓库自带的是某个账号下的真实命名空间 ID，换账号部署会报 namespace not found。
+      - name: Setup & Bind KV Namespace
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
+        run: |
+          toml_get() {
+            grep -m1 -E "^[[:space:]]*$1[[:space:]]*=" wrangler.toml \
+              | sed -E 's/^[^=]*=[[:space:]]*"?([^"[:space:]]+)"?.*$/\1/'
+          }
+
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}"
+          CUR_ID=$(toml_get id)
+          KV_ID="${CLOUDFLARE_KV_NAMESPACE_ID}"
+
+          NS_LIST=$(curl -s -X GET "${API}/storage/kv/namespaces?per_page=100" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" || echo "{}")
+
+          # 配置里那个 ID 正好属于当前账号（多数情况就是在原账号上部署）时直接沿用，不重复建
+          if [ -z "$KV_ID" ] && [ -n "$CUR_ID" ] \
+             && echo "$NS_LIST" | jq -e --arg i "$CUR_ID" '.result[]? | select(.id==$i)' >/dev/null 2>&1; then
+            KV_ID="$CUR_ID"
+            echo "✅ 已存在的 KV 命名空间 [$KV_ID] 属于当前账号，保持不变"
+          fi
+
+          if [ -z "$KV_ID" ]; then
+            # 优先沿用配置里那个命名空间的标题，取不到就用默认名
+            KV_TITLE=$(echo "$NS_LIST" | jq -r --arg i "$CUR_ID" '.result[]? | select(.id==$i) | .title' 2>/dev/null | head -n 1 || echo "")
+            if [ -z "$KV_TITLE" ] || [ "$KV_TITLE" == "null" ]; then
+              KV_TITLE="dnshe-panel-kv"
+            fi
+
+            echo "⚡ 正在为您在 Cloudflare 自动一键创建 KV 命名空间 [${KV_TITLE}]..."
+            CREATE_RES=$(curl -s -X POST "${API}/storage/kv/namespaces" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\":\"${KV_TITLE}\"}" || echo "{}")
+            KV_ID=$(echo "$CREATE_RES" | jq -r '.result.id // empty' 2>/dev/null || echo "")
+          fi
+
+          if [ -n "$KV_ID" ] && [ "$KV_ID" != "null" ]; then
+            if [ -n "$CUR_ID" ] && [ "$CUR_ID" != "$KV_ID" ]; then
+              sed -i "s|${CUR_ID}|${KV_ID}|g" wrangler.toml
+            else
+              sed -i -E "s|^([[:space:]]*id[[:space:]]*=).*|\1 \"${KV_ID}\"|" wrangler.toml
+            fi
+            echo "🎉 成功将 KV 命名空间 ID [$KV_ID] 绑定写入 wrangler.toml"
+          else
+            echo "⚠️ 未能自动获取/创建 KV 命名空间 ID，请检查 API Token 权限是否包含 [Workers KV Storage:编辑]"
+          fi
+
+      # 前端已与后端同源（由同一个 Worker 的静态资源发出），构建期不需要知道后端地址。
+      # 这一步只剩两件事：绑了自定义域名就关掉 workers.dev / 预览 URL，以及把最终访问地址写进摘要。
+      - name: Auto Detect Custom Domain & Configure Worker Routes
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          WORKER_NAME=$(grep -m1 -E '^[[:space:]]*name[[:space:]]*=' wrangler.toml | sed -E 's/.*=[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')
+          echo "🔍 正在检测 Worker [${WORKER_NAME}] 是否已绑定自定义域名..."
+
+          # 1. 查询 Custom Domains
+          DOMAINS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/domains" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" || echo "{}")
+
+          CUSTOM_DOMAIN=$(echo "$DOMAINS_JSON" | jq -r --arg w "$WORKER_NAME" '.result[]? | select(.service==$w) | .hostname' 2>/dev/null | head -n 1 || echo "")
+
+          # 2. 若未找到，尝试从 Worker Routes 中查找
+          if [ -z "$CUSTOM_DOMAIN" ] || [ "$CUSTOM_DOMAIN" == "null" ]; then
+            ZONES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?per_page=50" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+
+            ZONE_IDS=$(echo "$ZONES_JSON" | jq -r '.result[]?.id' 2>/dev/null || echo "")
+            for ZID in $ZONE_IDS; do
+              ROUTES_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${ZID}/workers/routes" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" || echo "{}")
+
+              ROUTE_PATTERN=$(echo "$ROUTES_JSON" | jq -r --arg w "$WORKER_NAME" '.result[]? | select(.script==$w or .service==$w) | .pattern' 2>/dev/null | head -n 1 || echo "")
+              if [ -n "$ROUTE_PATTERN" ] && [ "$ROUTE_PATTERN" != "null" ]; then
+                CLEAN_DOMAIN=$(echo "$ROUTE_PATTERN" | sed 's/\*//g' | sed 's/\/*$//' | sed 's/^\/*//')
+                if [ -n "$CLEAN_DOMAIN" ]; then
+                  CUSTOM_DOMAIN="$CLEAN_DOMAIN"
+                  echo "🎉 检测到自定义域名（从 Routes）: https://${CUSTOM_DOMAIN}"
+                  break
+                fi
+              fi
+            done
+          else
+            echo "🎉 检测到自定义域名（从 Custom Domains）: https://${CUSTOM_DOMAIN}"
+          fi
+
+          # 3. 根据检测结果配置 workers_dev 和 preview_urls
+          if [ -n "$CUSTOM_DOMAIN" ] && [ "$CUSTOM_DOMAIN" != "null" ]; then
+            echo "✅ 已绑定自定义域名，注入 workers_dev = false 和 preview_urls = false 到 wrangler.toml"
+            # 确保幂等：先删除旧的配置行（如果存在），再追加新配置
+            sed -i '/^workers_dev = /d' wrangler.toml
+            sed -i '/^preview_urls = /d' wrangler.toml
+            # 在 compatibility_date 行之后插入
+            sed -i '/^compatibility_date = /a workers_dev = false\npreview_urls = false' wrangler.toml
+            echo "APP_URL=https://${CUSTOM_DOMAIN}" >> $GITHUB_ENV
+          else
+            echo "⚠️ 未检测到自定义域名，保持 workers.dev 和预览 URL 默认开启"
+            # 查询默认 workers.dev 子域名，仅用于在摘要里给出访问地址
+            SUBDOMAIN_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" || echo "{}")
+
+            WORKERS_SUBDOMAIN=$(echo "$SUBDOMAIN_JSON" | jq -r '.result.subdomain // empty' 2>/dev/null || echo "")
+
+            if [ -n "$WORKERS_SUBDOMAIN" ]; then
+              echo "APP_URL=https://${WORKER_NAME}.${WORKERS_SUBDOMAIN}.workers.dev" >> $GITHUB_ENV
+            fi
+          fi
+
+      # 必须在 wrangler deploy 之前：wrangler.toml 的 assets.directory 指向 frontend/dist，
+      # 目录不存在部署会直接失败。
+      #
+      # VITE_API_BASE_URL 设成 "/"：前端与 Worker 同源，App.tsx 里会把末尾斜杠削掉，
+      # 请求最终是 /api/xxx 这样的相对路径，既不用配 CORS，也不用把域名烘焙进产物。
+      - name: Build Frontend
+        env:
+          VITE_API_BASE_URL: /
+        run: |
+          cd frontend
+          npm run build
+
+      # 一次 deploy 同时上传 Worker 脚本与 frontend/dist 里的静态资源
+      - name: Deploy Worker (API + Frontend Assets)
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.127.0'
+
+      - name: Auto-Configure & Sync AES_KEY Secret
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AES_KEY: ${{ secrets.AES_KEY }}
+        run: |
+          # 1. GitHub Secrets 已配置 AES_KEY → 优先使用用户自定义密钥
+          if [ -n "$AES_KEY" ]; then
+            echo "🔐 使用 GitHub Secret 中配置的 AES_KEY 同步到 Worker..."
+            echo "$AES_KEY" | npx wrangler secret put AES_KEY
+          # 2. Worker 上已有 AES_KEY → 保持稳定，不重新生成（否则已加密数据将无法解密）
+          elif npx wrangler secret list 2>/dev/null | grep -q "AES_KEY"; then
+            echo "🔐 AES_KEY 已存在于 Worker，保持现有密钥不变..."
+          # 3. 首次部署 → 自动生成随机 AES_KEY 并写入 Worker
+          else
+            echo "🔐 首次部署，自动生成 AES_KEY 并写入 Worker..."
+            NEW_KEY=$(openssl rand -hex 32)
+            echo "$NEW_KEY" | npx wrangler secret put AES_KEY
+            # 尽力写回 GitHub Secrets，便于本地开发参考（失败不影响部署）
+            if command -v gh >/dev/null 2>&1; then
+              echo "$NEW_KEY" | gh secret set AES_KEY --repo "${GITHUB_REPOSITORY}" || true
+            fi
+          fi
+
+      - name: Sync Optional Secrets to Worker (if set)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          ALLOWED_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
+        run: |
+          if [ -n "$ADMIN_TOKEN" ]; then
+            echo "🔑 正在同步更新 ADMIN_TOKEN 口令到 Cloudflare Worker..."
+            echo "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN || true
+          fi
+          if [ -n "$WEBHOOK_URL" ]; then
+            echo "🔔 正在同步更新 WEBHOOK_URL 推送地址到 Cloudflare Worker..."
+            echo "$WEBHOOK_URL" | npx wrangler secret put WEBHOOK_URL || true
+          fi
+          # 前后端同源后，正常部署不需要这一项；只有把前端另行托管到别的域名时才要配，
+          # 漏配的表现是登录页一句 Failed to fetch。
+          if [ -n "$ALLOWED_ORIGIN" ]; then
+            echo "🌐 正在同步更新 ALLOWED_ORIGIN 跨域白名单到 Cloudflare Worker..."
+            echo "$ALLOWED_ORIGIN" | npx wrangler secret put ALLOWED_ORIGIN || true
+          fi
+
+      - name: Summarize Access URL
+        env:
+          APP_URL: ${{ env.APP_URL }}
+        run: |
+          {
+            echo "### 访问地址"
+            echo
+            if [ -n "$APP_URL" ]; then
+              echo "\`${APP_URL}\`"
+              echo
+              echo "前端与 API 都在这个地址上（同一个 Worker）。首次进入请在登录页自行设置管理员用户名与密码。"
+            else
+              echo "⚠️ 未能检测到访问地址（既无自定义域名，也未取到 workers.dev 子域）。"
+              echo "部署本身可能已成功，请到 Cloudflare Dashboard → Workers & Pages 查看。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

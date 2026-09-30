@@ -1,0 +1,33 @@
+# shydns.cc.cd · DNSHE 多账号域名集控面板
+#
+# 由 lioil522/dnshe-manager 二次开发而来：在上游基础上补齐概览指标卡与账户配额、
+# 域名注册查重、运行日志、API 密钥集中管理与域名助力等功能。
+name = "dnshe-panel"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+workers_dev = false
+preview_urls = false
+
+[assets]
+directory = "./frontend/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "shydns-console-db"
+database_id = "6a01f49c-db70-40f3-b1e6-db4a3d9afd55"
+
+# 域名助力缓存
+[[kv_namespaces]]
+binding = "ASSIST_KV"
+id = "f44739ac9544450da6f1b585fdd51fdf"
+
+# 定时任务：每小时跑一轮，每轮只同步一个账号（轮转，见 cron.ts 的 sync_cursor）。
+# ⚠️ 不能写成「整包同步所有账号」——每域名一次 listDnsRecords，50 个域名就会撞上
+#    Workers 免费版单次调用 50 个子请求的上限，超限部分被静默吞掉。
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
+# AES_KEY 走 wrangler secret put 注入，用于加密 API Secret、API 密钥 Secret 与 2FA 密钥
