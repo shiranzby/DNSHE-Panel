@@ -44,7 +44,8 @@ import {
   Rocket,
   Award,
   Lock,
-  Filter
+  Filter,
+  RotateCcw
 } from "lucide-react";
 import { toASCII, hasNonASCII, toUnicode } from "./punycode";
 import {
@@ -431,15 +432,15 @@ const DnsLineSelect: React.FC<{
  * 🔴 2026-09-30 第15轮重定档位语义（用户反馈「怎么改列数都没反应」）：
  *   - **auto 档独自承担移动端降级**：手机一律 1 列（用户原话「普通移动端的观感，
  *     全部自适应默认为 1 列是最好的」）→ 平板 2 → 桌面 3 → 宽屏 4。
- *   - **显式档（2/3/4/6）选几列就是几列**，不再降级。原来每档都在手机段写死 2 列，
+ *   - **显式档（1/2/3/4）选几列就是几列**，不再降级。原来每档都在手机段写死 2 列，
  *     于是 2/3/4/6 在手机上长得一模一样，用户以为控件坏了。选了没反应比选得挤更糟。
  */
 const OVERVIEW_COL_CLASS: Record<string, string> = {
   auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  "1": "grid-cols-1",
   "2": "grid-cols-2",
   "3": "grid-cols-3",
   "4": "grid-cols-4",
-  "6": "grid-cols-6",
 };
 
 /**
@@ -450,10 +451,10 @@ const OVERVIEW_COL_CLASS: Record<string, string> = {
  */
 const QUOTA_COL_CLASS: Record<string, string> = {
   auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  "1": "grid-cols-1",
   "2": "grid-cols-2",
   "3": "grid-cols-3",
   "4": "grid-cols-4",
-  "6": "grid-cols-6",
 };
 
 /**
@@ -468,18 +469,30 @@ const QUOTA_COL_CLASS: Record<string, string> = {
  */
 const CF_COL_CLASS: Record<string, string> = {
   auto: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  "1": "grid-cols-1",
   "2": "grid-cols-1 sm:grid-cols-2",
   "3": "grid-cols-1 sm:grid-cols-3",
   "4": "grid-cols-1 sm:grid-cols-4",
-  "6": "grid-cols-1 sm:grid-cols-6",
 };
 
+/**
+ * 列数档位选项（概览页与 Cloudflare 页共用）
+ *
+ * 🔴 2026-09-30 第16轮：用户要求「适配自动、1列、2列、3列、4列，不需要5列6列的显示」。
+ *   原来只有 2/3/4/6 四档，缺最常用的「1 列」、多了几乎没人用的「6 列」
+ *   —— 手机上一张卡一行就得选 `auto`，而 `auto` 在桌面又会变 3/4 列，用户没得挑。
+ *   现在五档：自动 + 1/2/3/4。
+ *
+ * ⚠️ 档位集合一变，`localStorage` 里的历史值（如 `"6"`）就成了**无对应 option 的值**，
+ *    `<select value="6">` 会渲染成空白。渲染侧本来就有 `|| CLASS.auto` 兜底，
+ *    但选择器本身会看起来"没选中任何一项"，所以读取时按白名单过滤一遍（见 overviewCols 的初始化）。
+ */
 const OVERVIEW_COL_OPTIONS = [
   { value: "auto", label: "自动" },
+  { value: "1", label: "1 列" },
   { value: "2", label: "2 列" },
   { value: "3", label: "3 列" },
   { value: "4", label: "4 列" },
-  { value: "6", label: "6 列" },
 ];
 
 /**
@@ -499,9 +512,57 @@ const SEARCH_CONFIG: Record<string, { placeholder: string; enabled: boolean }> =
   register: { placeholder: "搜索域名（回车跳转域名列表）", enabled: true },
   quota: { placeholder: "搜索账号", enabled: true },
   logs: { placeholder: "搜索日志内容", enabled: true },
-  // 设置页是固定表单，没有可检索的列表 —— 直接不显示搜索框，别给一个搜不出东西的框
-  settings: { placeholder: "", enabled: false },
+  /*
+   * 设置页：2026-09-30 第16轮之前是 `enabled: false`（「固定表单，没有可检索的列表」）。
+   * 用户要求「设置页也可以适配顶栏的像其他页一样的输入搜索框，改为搜索功能即可
+   * （后端地址、账户安全、自动续期、解析线路支持名单、通知渠道以及他们的各子级标题
+   * 如修改登录密码等）都可以搜索」。
+   * ⇒ 设置页的「可检索列表」就是**小节卡片**本身，按 SETTINGS_SECTIONS 的 keywords 匹配。
+   */
+  settings: { placeholder: "搜索设置项（如：密码 / 续期 / 渠道）", enabled: true },
 };
+
+/**
+ * 设置页各小节（同时服务两件事：顶栏搜索按关键词过滤、抽屉里的二级菜单跳转）
+ *
+ * - `id`：卡片 DOM 的 id，抽屉二级菜单点进来时 `scrollIntoView` 用。
+ * - `label`：抽屉二级菜单显示的名字。
+ * - `keywords`：搜索用的关键词串（含**子标题**，如「修改登录密码」「两步验证」）——
+ *   用户明确要求「他们的各子级标题如修改登录密码等都可以搜索」。
+ *   匹配方式是「关键词串包含用户输入」（见 settingsSectionVisible），
+ *   所以这里要把同义说法、中英文都写进去，漏一个就是搜不到。
+ */
+const SETTINGS_SECTIONS: Array<{ id: string; label: string; keywords: string }> = [
+  {
+    id: "settings-backend",
+    label: "后端地址",
+    keywords:
+      "后端地址 后端 worker 地址 workers.dev 自定义后端 服务器地址 已配置 未配置 自动推演 恢复自动",
+  },
+  {
+    id: "settings-security",
+    label: "账户安全",
+    keywords:
+      "账户安全 当前管理员 管理员用户名 修改登录密码 修改密码 原密码 新密码 确认新密码 同时修改用户名 保存新密码 两步验证 2fa totp 动态码 二维码 密钥 secret 开启两步验证 关闭 2fa 已开启 未开启",
+  },
+  {
+    id: "settings-renew",
+    label: "自动续期",
+    keywords: "自动续期 启用自动续期 续期阈值 阈值 天数 即将到期 renew",
+  },
+  {
+    id: "settings-line-ns",
+    label: "解析线路支持名单",
+    keywords:
+      "解析线路支持名单 线路解析 线路 ns 后缀 ns 记录 根域名 判定结果 电信 联通 移动 海外 教育网 添加 恢复默认 清空实测标记 重新查询 ns",
+  },
+  {
+    id: "settings-notify",
+    label: "通知渠道",
+    keywords:
+      "通知渠道 渠道选择 保存全部设置 邮箱 smtp 端口 发件邮箱 收件邮箱 发件人显示名 授权码 telegram 钉钉 飞书 企业微信 server酱 方糖 通用 webhook bot token chat id sendkey",
+  },
+];
 
 /**
  * 概览页指标卡
@@ -604,6 +665,14 @@ export default function App() {
 
   // 手机端侧栏抽屉开关（仅 <md 生效；≥md 侧栏常驻，这个状态用不上）
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  /**
+   * 抽屉里「展开中的二级菜单」是哪一个（值为顶层页签 key，null = 全部收起）
+   *
+   * 目前只有「设置」有下级小节：其余页签都是一个整页、没有可拆的子项。
+   * 默认全部收起（§6：数量不确定的列表默认收起），否则抽屉一打开就多出 5 行。
+   */
+  const [navExpanded, setNavExpanded] = useState<string | null>(null);
 
   /**
    * 是否处于 md 及以上宽度 —— 手机抽屉与桌面常驻侧栏的分界
@@ -1091,6 +1160,8 @@ export default function App() {
   });
   // 新增 NS 后缀的输入框
   const [newLineNsInput, setNewLineNsInput] = useState("");
+  // 「恢复默认」的二次确认框（§9：破坏性操作必须二次确认；这里是覆盖用户手工维护的名单）
+  const [restoreNsConfirmOpen, setRestoreNsConfirmOpen] = useState(false);
 
   // 根域 -> NS 主机名列表的本地镜像（null 表示查过但没查到）。
   // 后端已经把结论缓存在 D1，这份镜像只为让首屏判定不用等网络往返。
@@ -1937,6 +2008,55 @@ export default function App() {
     ? (SEARCH_CONFIG[activeTab]?.placeholder || "搜索").split("（")[0]
     : (SEARCH_CONFIG[activeTab]?.placeholder || "搜索...");
 
+  /**
+   * 设置页搜索（2026-09-30 第16轮）
+   *
+   * 设置页没有「列表」可筛，可检索的对象就是**小节卡片**本身：
+   * 命中规则 = 该小节的 keywords 串包含用户输入（大小写不敏感）。
+   * 用「包含」而不是分词，是因为用户输入本身就是半个词（「密码」「续期」「渠道」），
+   * 分词反而会把这类前缀/子串挡在外面。
+   *
+   * ⚠️ 只在设置页生效：`activeTab !== "settings"` 时恒为可见，
+   *    否则会把其它页的搜索词带到设置页、打开就是一片空白。
+   */
+  const settingsSearchKw = globalSearch.trim().toLowerCase();
+  const isSettingsSearchActive = activeTab === "settings" && settingsSearchKw.length > 0;
+  const settingsSectionVisible = (sectionId: string) => {
+    if (!isSettingsSearchActive) return true;
+    const sec = SETTINGS_SECTIONS.find((s) => s.id === sectionId);
+    return !!sec && sec.keywords.toLowerCase().includes(settingsSearchKw);
+  };
+  const settingsHitCount = isSettingsSearchActive
+    ? SETTINGS_SECTIONS.filter((s) => s.keywords.toLowerCase().includes(settingsSearchKw)).length
+    : SETTINGS_SECTIONS.length;
+
+  /**
+   * 跳到设置页某个小节（抽屉二级菜单用）
+   *
+   * NOTE: 不能直接 `scrollIntoView` —— 切页与设置数据加载都是异步的：
+   * 目标卡片在「设置页数据还没到位」时根本不在 DOM 里（页面此时是 loading 态）。
+   * 所以按 120ms 轮询等它出现（最多 ~1.5s），出现后平滑滚过去并描一圈高亮，
+   * 让用户看得见"跳到了哪一张卡"。
+   */
+  const scrollToSettingsSection = (sectionId: string) => {
+    let tries = 0;
+    const tick = () => {
+      const el = document.getElementById(sectionId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        el.style.outline = "2px solid rgb(99 102 241 / 0.65)";
+        el.style.outlineOffset = "4px";
+        window.setTimeout(() => {
+          el.style.outline = "";
+          el.style.outlineOffset = "";
+        }, 1600);
+        return;
+      }
+      if (tries++ < 12) window.setTimeout(tick, 120);
+    };
+    window.setTimeout(tick, 60);
+  };
+
   /** 分批域名同步的进度（null = 未在同步） */
   const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null);
 
@@ -1962,18 +2082,21 @@ export default function App() {
    *   旧版每档手机段都被写死（选 `3` 在手机上其实只给 2 列），新版 `3` 字面就是 3 列。
    *   旧值的含义已失效，若继续沿用，用户在手机上会继承一个语义已经变了的数字，
    *   而用户这次的要求正是「概览移动端默认 1 列」⇒ 让老值落空、回到 `auto` 才是对的。
+   * 🔴 2026-09-30 第16轮：档位集合变了（去掉 6 列、新增 1 列）⇒ 读取时按 option 白名单过滤。
+   *   历史值 `"6"` 已无对应 option，`<select value="6">` 会渲染成「什么都没选中」；
+   *   这里直接落空回 `auto`，用户下次进页面看到的是一份合法选择。
    */
-  const [overviewCols, setOverviewCols] = useState<string>(
-    () => localStorage.getItem("DNSHE_OVERVIEW_COLS_V2") || "auto"
-  );
+  const readColPref = (key: string) => {
+    const v = localStorage.getItem(key);
+    return v && OVERVIEW_COL_OPTIONS.some((o) => o.value === v) ? v : "auto";
+  };
+  const [overviewCols, setOverviewCols] = useState<string>(() => readColPref("DNSHE_OVERVIEW_COLS_V2"));
   useEffect(() => {
     localStorage.setItem("DNSHE_OVERVIEW_COLS_V2", overviewCols);
   }, [overviewCols]);
 
   /** Cloudflare 页 zone 卡每行列数（独立于概览页，两页密度需求不同）；键名迁移理由同上 */
-  const [cfCols, setCfCols] = useState<string>(
-    () => localStorage.getItem("DNSHE_CF_COLS_V2") || "auto"
-  );
+  const [cfCols, setCfCols] = useState<string>(() => readColPref("DNSHE_CF_COLS_V2"));
   useEffect(() => {
     localStorage.setItem("DNSHE_CF_COLS_V2", cfCols);
   }, [cfCols]);
@@ -5206,9 +5329,24 @@ export default function App() {
     persistLineNsSuffixes(lineNsSuffixes.filter((s) => s !== sfx));
   };
 
+  /**
+   * 恢复默认 NS 后缀名单
+   *
+   * §9：这会**整份覆盖**用户手工维护的名单，属于破坏性操作 ⇒ 入口按钮先弹二次确认框，
+   * 确认后才执行。§8：收尾必须说清「加了几条 / 删了几条」，不能只说一句「已恢复」——
+   * 名单本来就等于默认值时，用户需要知道"确实没变化"而不是"是不是没生效"。
+   */
   const handleRestoreLineNsSuffixes = () => {
+    const removed = lineNsSuffixes.filter((s) => !DEFAULT_LINE_NS_SUFFIXES.includes(s)).length;
+    const added = DEFAULT_LINE_NS_SUFFIXES.filter((s) => !lineNsSuffixes.includes(s)).length;
     persistLineNsSuffixes(DEFAULT_LINE_NS_SUFFIXES);
-    showToast("success", "已恢复默认 NS 后缀名单");
+    setRestoreNsConfirmOpen(false);
+    showToast(
+      "success",
+      removed || added
+        ? `已恢复默认 NS 后缀名单（新增 ${added} 个 / 移除 ${removed} 个自定义后缀）`
+        : "已恢复默认 NS 后缀名单（当前名单本来就与默认一致）"
+    );
   };
 
   // 清空「实测已确认」的根域（判定优先级最高，误判时需要能撤掉）
@@ -6024,34 +6162,90 @@ export default function App() {
 
         {/* 菜单项 */}
         <nav className="flex-1 py-4 px-2 space-y-1 overflow-y-auto">
-          {navItems.map((item) => (
-            <button
-              key={item.key}
-              onClick={() => {
-                setActiveTab(item.key);
-                // 手机上选完就收起抽屉，否则内容被遮住还得再点一次
-                setSidebarOpen(false);
-              }}
-              title={railMode ? item.label : undefined}
-              className={`group w-full flex items-center gap-3 px-3 py-3 md:py-2.5 rounded-lg text-sm font-semibold transition-all ${
-                activeTab === item.key
-                  ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
-                  : "text-content-muted hover:text-content-primary hover:bg-hovered"
-              } ${railMode ? "justify-center" : ""}`}
-            >
-              <span className="flex-shrink-0">{item.icon}</span>
-              {!railMode && (
-                <>
-                  <span className="flex-1 text-left whitespace-nowrap">{item.label}</span>
-                  {item.badge !== undefined && item.badge > 0 && (
-                    <span className="text-xs px-1.5 py-0.5 rounded-full bg-black/20 text-current opacity-80">
-                      {item.badge}
-                    </span>
+          {navItems.map((item) => {
+            /*
+              二级菜单：目前只有「设置」有下级小节（后端地址 / 账户安全 / 自动续期 /
+              解析线路支持名单 / 通知渠道），其余页签是一个整页、没有可拆的子项。
+              railMode（桌面折叠成图标条）下不渲染二级菜单 —— 那个宽度放不下文字。
+            */
+            const children = item.key === "settings" ? SETTINGS_SECTIONS : null;
+            const expanded = navExpanded === item.key;
+            return (
+              <div key={item.key}>
+                <div className="flex items-center gap-0.5">
+                  <button
+                    onClick={() => {
+                      setActiveTab(item.key);
+                      // 手机上选完就收起抽屉，否则内容被遮住还得再点一次
+                      setSidebarOpen(false);
+                    }}
+                    title={railMode ? item.label : undefined}
+                    className={`group flex-1 min-w-0 flex items-center gap-3 px-3 py-3 md:py-2.5 rounded-lg text-sm font-semibold transition-all ${
+                      activeTab === item.key
+                        ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
+                        : "text-content-muted hover:text-content-primary hover:bg-hovered"
+                    } ${railMode ? "justify-center" : ""}`}
+                  >
+                    <span className="flex-shrink-0">{item.icon}</span>
+                    {!railMode && (
+                      <>
+                        <span className="flex-1 text-left whitespace-nowrap">{item.label}</span>
+                        {item.badge !== undefined && item.badge > 0 && (
+                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-black/20 text-current opacity-80">
+                            {item.badge}
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </button>
+                  {/* 展开/收起二级菜单的箭头。与左侧主按钮同一行，只占图标宽 */}
+                  {children && !railMode && (
+                    <button
+                      onClick={() => setNavExpanded(expanded ? null : item.key)}
+                      className="p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0"
+                      title={expanded ? `收起「${item.label}」子菜单` : `展开「${item.label}」子菜单`}
+                      aria-label={expanded ? "收起子菜单" : "展开子菜单"}
+                      aria-expanded={expanded}
+                    >
+                      <ChevronDown
+                        className={`w-4 h-4 transition-transform duration-300 ${expanded ? "rotate-180" : ""}`}
+                      />
+                    </button>
                   )}
-                </>
-              )}
-            </button>
-          ))}
+                </div>
+                {/*
+                  二级菜单容器用 .nav-sublist（grid-template-rows 0fr↔1fr 过渡，见 index.css）：
+                  收起态是**高度 0 + overflow hidden**，不是「不渲染」，这样才能做出展开/收起动画。
+                  代价是收起时子项仍在 DOM 里 ⇒ 用 tabIndex={-1} 把它们移出键盘 Tab 序列，
+                  否则键盘用户会 focus 到看不见的按钮上。
+                */}
+                {children && !railMode && (
+                  <div className="nav-sublist" data-open={expanded ? "true" : "false"}>
+                    <div>
+                      <div className="pt-1 pb-0.5 space-y-0.5">
+                        {children.map((c) => (
+                          <button
+                            key={c.id}
+                            tabIndex={expanded ? 0 : -1}
+                            onClick={() => {
+                              // 先切到设置页再滚过去；滚动要等设置数据渲染出来，见 scrollToSettingsSection
+                              setActiveTab("settings");
+                              setSidebarOpen(false);
+                              scrollToSettingsSection(c.id);
+                            }}
+                            className="w-full flex items-center gap-2 pl-9 pr-3 py-2 rounded-lg text-xs font-semibold text-content-muted hover:text-content-primary hover:bg-hovered transition-all"
+                          >
+                            <span className="w-1 h-1 rounded-full bg-current flex-shrink-0" />
+                            <span className="min-w-0 truncate text-left">{c.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </nav>
 
         {/* 抽屉底部退出入口（仅手机）：头部横向空间紧张，退出按钮挪到这里 */}
@@ -6071,15 +6265,6 @@ export default function App() {
 
         {/* ===== 顶部栏 ===== */}
         <header className="h-16 flex-shrink-0 flex items-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-6 border-b border-border-base bg-surface">
-          {/* 汉堡按钮：唤出手机抽屉（≥md 侧栏常驻，折叠切换在侧栏内部） */}
-          <button
-            onClick={() => setSidebarOpen(true)}
-            className="md:hidden h-10 w-10 p-0 -ml-1 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
-            title="打开菜单"
-          >
-            <Menu className="w-5 h-5" />
-          </button>
-
           {/* 全局搜索框 */}
           {/*
             NOTE: min-w-0 是必需的 —— flex 子项默认 min-width:auto，没有它 flex-1 不会真的收缩。
@@ -6198,6 +6383,26 @@ export default function App() {
             title={theme === "dark" ? "切换到亮色" : "切换到暗色"}
           >
             {theme === "dark" ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+          </button>
+
+          {/*
+            汉堡按钮：唤出手机抽屉（≥md 侧栏常驻，折叠切换在侧栏内部）
+            2026-09-30 第16轮按用户要求从「搜索框左边」挪到「主题切换右边」——
+            原话：「打开菜单按钮放在主题切换按钮的右边，即贴在顶栏的右边，更符合人的操作习惯」。
+            拇指从右下角往上够右手边的最后一个按钮，比横跨整个屏幕去够左上角顺手。
+
+            ⚠️ 尺寸**故意保持 `h-10 w-10`（40×40）而不是用户给出的 `h-9 w-9`（36×36）**：
+               顶栏里它和 h-10 的搜索框同行，§9 明文规定「顶栏/工具行图标按钮一律 h-10 w-10，
+               不允许出现 h-9」。36px 会同时违反「触控 ≥40px」与「同行控件等高」两条，
+               而且它是**唯一**会露出 36px 的按钮 —— 第13轮刚把全顶栏的 h-9 统一成 h-10。
+               位置按用户要求移，尺寸仍按规范：这是同一件事的两个维度，不冲突。
+          */}
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="md:hidden h-10 w-10 p-0 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0 flex items-center justify-center"
+            title="打开菜单"
+          >
+            <Menu className="w-5 h-5" />
           </button>
 
           {/* 退出登录：手机上头部空间紧张，入口挪进抽屉底部 */}
@@ -10282,6 +10487,17 @@ export default function App() {
             ) : (
               /* 桌面端两列均分（items-start 让两列各自按内容高度收拢，不被最高的一张拉平） */
               <>
+              {/* 搜索命中 0 条时必须有反馈（§8：不能静默）—— 否则卡片全被 hidden 掉，
+                  页面只剩下面那个「保存全部设置」，看起来像所有设置项都丢了 */}
+              {isSettingsSearchActive && settingsHitCount === 0 && (
+                <div className="text-center py-16 border border-dashed border-border-base rounded-xl bg-surface">
+                  <Search className="w-10 h-10 text-content-muted mx-auto mb-3" />
+                  <p className="text-content-muted text-sm">没有匹配「{globalSearch.trim()}」的设置项</p>
+                  <p className="text-xs text-content-muted mt-1">
+                    可试试：后端地址 / 密码 / 两步验证 / 续期 / 渠道
+                  </p>
+                </div>
+              )}
               {/* 桌面端用 CSS 多列做瀑布流：卡片沿列依次填满。
                   原来用 grid 两列时，每行的高度由该行最高的一张卡决定 ——
                   草稿里「后端地址」很短而「账户安全」很高，于是左列下方出现大片空白。
@@ -10292,7 +10508,10 @@ export default function App() {
                     主题切换保留在顶栏，任何页面都能直接点到，不必先进设置页。 */}
 
                 {/* 后端地址 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4">
+                <div
+                  id="settings-backend"
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-backend") ? "" : "hidden"}`}
+                >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Server className="w-4 h-4 text-indigo-400" /> 后端地址
                   </h3>
@@ -10300,17 +10519,32 @@ export default function App() {
                   {backendUrlEditing ? (
                     <div>
                       <label className="text-sm font-semibold text-content-primary">后端 Worker 地址</label>
-                      <div className="flex gap-2 mt-2">
-                        <input
-                          value={backendUrlInput}
-                          onChange={(e) => setBackendUrlInput(e.target.value)}
-                          placeholder="https://dnshe-panel.<子域>.workers.dev"
-                          className="form-input flex-1 px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
-                        />
-                        <button onClick={handleSaveBackendUrl} className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5">
-                          <Save className="w-4 h-4" /> 保存
+                      {/*
+                        NOTE: 第一行只放输入框、第二行放「保存 / 取消」两等分 —— 用户 2026-09-30 第16轮原话：
+                              「保存和取消功能控件移除，其实可在第二行显示均分控件 保存、取消」。
+                        原来三个控件挤在同一个 flex 行里：输入框被两个按钮吃掉一半宽度，
+                        而按钮又各自靠右，跟上面的 label 完全不对齐；窄屏一折行还会变成
+                        「输入框一行 + 两个按钮一行」但**宽度不相等**（按钮按内容宽，不是均分）。
+                        现在第二行用 `grid grid-cols-2`，两个按钮严格各占一半、合起来正好等于
+                        上面输入框的宽度（§14 第 1 条：控件放不下时按对称切分，2 个控件只能 1+1）。
+                      */}
+                      <input
+                        value={backendUrlInput}
+                        onChange={(e) => setBackendUrlInput(e.target.value)}
+                        placeholder="https://dnshe-panel.<子域>.workers.dev"
+                        className="form-input w-full mt-2 px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                      />
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <button
+                          onClick={handleSaveBackendUrl}
+                          className="btn-primary h-10 px-3 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-1.5 whitespace-nowrap"
+                        >
+                          <Save className="w-4 h-4 flex-shrink-0" /> 保存
                         </button>
-                        <button onClick={handleCancelBackendUrl} className="bg-elevated hover:bg-hovered text-content-muted border border-border-base px-4 py-2 rounded-lg text-sm">
+                        <button
+                          onClick={handleCancelBackendUrl}
+                          className="h-10 px-3 rounded-lg text-sm font-semibold whitespace-nowrap bg-elevated hover:bg-hovered text-content-secondary border border-border-base"
+                        >
                           取消
                         </button>
                       </div>
@@ -10342,7 +10576,10 @@ export default function App() {
                 </div>
 
                 {/* 账户安全：修改密码 + 两步验证 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-5">
+                <div
+                  id="settings-security"
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-5 ${settingsSectionVisible("settings-security") ? "" : "hidden"}`}
+                >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <ShieldCheck className="w-4 h-4 text-emerald-400" /> 账户安全
                   </h3>
@@ -10461,26 +10698,32 @@ export default function App() {
                               {twoFaSetup.secret}
                             </div>
                             <p className="text-xs text-content-secondary">2. 输入验证器当前显示的 6 位动态码以完成开启：</p>
-                            <div className="flex flex-wrap gap-2">
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                maxLength={6}
-                                value={twoFaEnableToken}
-                                onChange={(e) => setTwoFaEnableToken(e.target.value.replace(/\D/g, ""))}
-                                placeholder="6 位动态码"
-                                className="form-input flex-1 px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
-                              />
+                            {/*
+                              NOTE: 与「后端地址」同一套形状 —— 输入框第一行独占，动作按钮第二行两等分。
+                              用户 2026-09-30 第16轮原话：「确认开启、取消 也改为一行两个控件均分撑满，
+                              对齐上面的输入框」。原来 `flex flex-wrap` 里输入框 `flex-1`、
+                              两个按钮按内容宽靠右，窄屏折行后两按钮宽度还不相等。
+                            */}
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              maxLength={6}
+                              value={twoFaEnableToken}
+                              onChange={(e) => setTwoFaEnableToken(e.target.value.replace(/\D/g, ""))}
+                              placeholder="6 位动态码"
+                              className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                            />
+                            <div className="grid grid-cols-2 gap-2">
                               <button
                                 onClick={handleEnable2fa}
                                 disabled={actionLoading === "2fa-enable"}
-                                className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50"
+                                className="btn-primary h-10 px-3 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-1.5 whitespace-nowrap disabled:opacity-50"
                               >
-                                <CheckCircle2 className="w-4 h-4" /> 确认开启
+                                <CheckCircle2 className="w-4 h-4 flex-shrink-0" /> 确认开启
                               </button>
                               <button
                                 onClick={() => { setTwoFaSetup(null); setTwoFaEnableToken(""); }}
-                                className="bg-elevated hover:bg-hovered text-content-muted border border-border-base px-3 py-2 rounded-lg text-sm"
+                                className="h-10 px-3 rounded-lg text-sm font-semibold whitespace-nowrap bg-elevated hover:bg-hovered text-content-secondary border border-border-base"
                               >
                                 取消
                               </button>
@@ -10513,7 +10756,10 @@ export default function App() {
                 </div>
 
                 {/* 自动续期 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4">
+                <div
+                  id="settings-renew"
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-renew") ? "" : "hidden"}`}
+                >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <RefreshCw className="w-4 h-4 text-emerald-400" /> 自动续期
                   </h3>
@@ -10542,10 +10788,30 @@ export default function App() {
                 </div>
 
                 {/* 解析线路支持名单 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4">
-                  <h3 className="font-bold text-content-primary flex items-center gap-2">
-                    <Server className="w-4 h-4 text-sky-600 dark:text-sky-400" /> 解析线路支持名单
-                  </h3>
+                <div
+                  id="settings-line-ns"
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-line-ns") ? "" : "hidden"}`}
+                >
+                  {/*
+                    NOTE: 「恢复默认」原来跟输入框、添加按钮挤在同一个表单行里 —— 它是**整份覆盖名单**
+                    的破坏性动作，却长得像第三个同级控件，且三者的高度/字号互不相同
+                    （输入框 h-10 text-sm，两个按钮 text-xs py-2 ≈ 32px，同行不等高，违反 §13/§18）。
+                    用户 2026-09-30 第16轮原话：「恢复默认控件应该直接放在…卡片的右上角，不要单独一行」。
+                    现在它挪到标题行右侧，与标题同一行；点击先弹二次确认框。
+                  */}
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="font-bold text-content-primary flex items-center gap-2 min-w-0">
+                      <Server className="w-4 h-4 text-sky-600 dark:text-sky-400 flex-shrink-0" />
+                      <span className="truncate">解析线路支持名单</span>
+                    </h3>
+                    <button
+                      onClick={() => setRestoreNsConfirmOpen(true)}
+                      className="h-10 px-3 rounded-lg text-sm font-semibold whitespace-nowrap flex items-center gap-1.5 flex-shrink-0 bg-elevated hover:bg-hovered text-content-secondary border border-border-base"
+                      title="把名单恢复为面板内置的默认值（会覆盖当前手工维护的名单）"
+                    >
+                      <RotateCcw className="w-4 h-4 flex-shrink-0" /> 恢复默认
+                    </button>
+                  </div>
                   <p className="text-xs text-content-muted leading-relaxed">
                     上游 API 没有「域名是否支持按线路解析」的字段，本面板按根域名的
                     <span className="font-mono text-indigo-600 dark:text-indigo-400"> NS 记录 </span>
@@ -10577,7 +10843,15 @@ export default function App() {
                     )}
                   </div>
 
-                  <form onSubmit={handleAddLineNsSuffix} className="flex flex-wrap items-center gap-2">
+                  {/*
+                    NOTE: 输入框与「添加」必须同高同字号（§13/§18 A 档 = h-10 text-sm）。
+                    原先输入框是 h-10 text-sm，而「添加 / 恢复默认」是 text-xs + py-2（≈32px），
+                    一行里三种规格，用户原话「都没有统一号」。
+                    宽度：输入框 `flex-1 min-w-0`（flex 子项默认 min-width:auto，不写 min-w-0
+                    它在 280px 上不会真的收缩），按钮 `flex-shrink-0` ——
+                    这样**任何宽度下都保持一行**，不会折不等的行（§14 第 1 条）。
+                  */}
+                  <form onSubmit={handleAddLineNsSuffix} className="flex items-center gap-2">
                     <input
                       type="text"
                       name="dnshe-line-ns-suffix"
@@ -10585,20 +10859,13 @@ export default function App() {
                       value={newLineNsInput}
                       onChange={(e) => setNewLineNsInput(e.target.value)}
                       placeholder="NS 后缀，如 alidns.com，可一次填多个（逗号 / 空格分隔）"
-                      className="form-input flex-1 min-w-[12rem] px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                      className="form-input flex-1 min-w-0 px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                     />
                     <button
                       type="submit"
-                      className="btn-primary px-3 py-2 rounded-lg text-xs font-bold text-white flex items-center gap-1.5 flex-shrink-0"
+                      className="btn-primary h-10 px-3 sm:px-4 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-1.5 flex-shrink-0 whitespace-nowrap"
                     >
-                      <Plus className="w-3.5 h-3.5" /> 添加
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleRestoreLineNsSuffixes}
-                      className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-2 rounded-lg text-xs font-semibold flex-shrink-0"
-                    >
-                      恢复默认
+                      <Plus className="w-4 h-4 flex-shrink-0" /> 添加
                     </button>
                   </form>
 
@@ -10651,7 +10918,10 @@ export default function App() {
                 </div>
 
                 {/* 通知 */}
-                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4">
+                <div
+                  id="settings-notify"
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-notify") ? "" : "hidden"}`}
+                >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Bell className="w-4 h-4 text-amber-400" /> 通知渠道
                   </h3>
@@ -11643,6 +11913,73 @@ export default function App() {
       )}
 
       {/* NS 域名服务器修改与重置模态框 (NS Modal) */}
+      {/*
+        「解析线路支持名单 → 恢复默认」的二次确认框（§9：破坏性操作必须二次确认）。
+        这一动作不是"追加"，而是**整份覆盖**用户手工维护的名单，所以确认文案要写清损失是什么，
+        并把「当前名单 vs 默认名单」并排列出来，让用户不用回忆自己加过什么。
+      */}
+      {restoreNsConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-surface border border-border-base w-full max-w-md rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
+              <h3 className="text-base font-bold text-content-primary flex items-center gap-2 min-w-0">
+                <RotateCcw className="w-5 h-5 text-amber-500 flex-shrink-0" />
+                <span className="truncate">恢复默认 NS 后缀名单</span>
+              </h3>
+              <button
+                onClick={() => setRestoreNsConfirmOpen(false)}
+                className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded flex-shrink-0"
+                title="关闭"
+                aria-label="关闭确认框"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-4 sm:p-6 space-y-4">
+              <div className="p-4 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200 flex gap-3">
+                <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+                <div className="space-y-1 min-w-0">
+                  <p className="font-bold">这会覆盖你当前维护的名单</p>
+                  <p className="text-xs leading-relaxed opacity-90">
+                    恢复后名单只保留内置默认值，你手工添加的后缀会被移除；已缓存的 NS 判定结果不受影响。
+                  </p>
+                </div>
+              </div>
+              <div className="text-xs space-y-2">
+                <div className="flex items-start gap-2">
+                  <span className="text-content-muted flex-shrink-0 w-16">当前名单</span>
+                  <span className="font-mono text-content-secondary break-all min-w-0">
+                    {lineNsSuffixes.length > 0
+                      ? lineNsSuffixes.map((s) => `*.${s}`).join("、")
+                      : "（空）"}
+                  </span>
+                </div>
+                <div className="flex items-start gap-2">
+                  <span className="text-content-muted flex-shrink-0 w-16">默认名单</span>
+                  <span className="font-mono text-content-secondary break-all min-w-0">
+                    {DEFAULT_LINE_NS_SUFFIXES.map((s) => `*.${s}`).join("、")}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-end gap-2 border-t border-border-base flex-shrink-0">
+              <button
+                onClick={() => setRestoreNsConfirmOpen(false)}
+                className="h-10 px-4 rounded-lg text-sm font-semibold whitespace-nowrap bg-elevated hover:bg-hovered text-content-secondary border border-border-base"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleRestoreLineNsSuffixes}
+                className="btn-primary h-10 px-4 rounded-lg text-sm font-bold text-white flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <RotateCcw className="w-4 h-4 flex-shrink-0" /> 确认恢复
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 删除域名确认弹窗 —— 不可逆操作，需输入完整域名二次确认 */}
       {deleteModalDomain && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
