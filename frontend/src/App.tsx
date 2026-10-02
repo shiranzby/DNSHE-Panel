@@ -9896,7 +9896,10 @@ export default function App() {
                   <p className="text-content-muted text-sm">尚未绑定 Cloudflare 账号，点击上方「绑定 Cloudflare 账号」用 API Token 绑定</p>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                /* 列数必须与下方「已绑定的 API 账号」一致（同为 2 列）。
+                   原来这里是 lg:grid-cols-3，2 个账号时只占 2/3、右侧空整整一列，
+                   与下面铺满的 2 列网格并排看就是「没均分」（见设计规范 §28）。 */
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {cfAccountList.map((acc) => (
                     <div key={acc.id} className="bg-surface border border-border-base rounded-xl p-4 flex items-center justify-between gap-2">
                       <div className="min-w-0">
