@@ -5,7 +5,7 @@
 [![构建自建镜像](https://github.com/shiranzby/DNSHE-Panel/actions/workflows/docker.yml/badge.svg)](https://github.com/shiranzby/DNSHE-Panel/actions/workflows/docker.yml)
 [![许可证: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-manager) 二次开发。上游已经提供了域名资产看板、Cloudflare 管理、定时同步与续期、通知推送和自建版 Node 适配；本仓库在它之上补齐了概览页指标卡与账户配额、域名注册查重、运行日志、API 密钥集中管理、域名助力与助力记录，并修掉了一批请求竞态与健壮性问题。同一套后端代码同时支持 **Cloudflare Workers** 与 **Docker 自建** 两种部署形态。
+DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-manager) 二次开发。上游已经提供了域名资产看板、Cloudflare 管理、定时同步与续期、通知推送和自建版 Node 适配；本仓库在它之上补齐了概览页指标卡与账户配额、域名注册查重、运行日志、API 密钥集中管理、域名助力与助力记录、**一键委派到 Cloudflare**，并修掉了一批请求竞态与健壮性问题。同一套后端代码同时支持 **Cloudflare Workers** 与 **Docker 自建** 两种部署形态。
 
 ---
 
@@ -24,6 +24,7 @@ DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-ma
 - **解析线路** — 识别支持按线路解析的根域，行内选择线路
 - **Cloudflare 管理** — 独立标签页绑定 Cloudflare 账号（绑定即在线校验 Token、别名自动取账号名），自动同步 zones；zone 卡支持全部记录类型的增删改与批量操作、橙色云代理开关、控制台深链
 - **跨站交叉提示** — DNSHE 域名若 NS 已指向 Cloudflare 且已绑定账号，一键跳转定位到对应的 zone 解析面板
+- **一键委派到 Cloudflare** — 面板内直接为该域名创建 Cloudflare zone，并把 Cloudflare 分配的两条 NS 写回 DNSHE 完成委派；**先完成委派，再把待迁移的解析记录列出来让你逐条勾选确认**，不会自动搬运解析。仅对已列入 Public Suffix List 的根域开放（`us.ci` / `cc.cd` / `de5.net` / `ccwu.cc`），其余根域的菜单项置灰并当场写明原因
 
 ### 注册与助力
 
@@ -372,11 +373,17 @@ DNSHE 不允许自己的号给自家域名助力。在确认弹窗里把那个�
 
 ### 自动续期会处理 Cloudflare 的域名吗？
 
-不会。Cloudflare 账号仅同步 zones 列表（有效期由注册商管理），不参与自动续期与配额统计；zone 的创建与删除请前往 Cloudflare 控制台。
+不会。Cloudflare 账号仅同步 zones 列表（有效期由注册商管理），不参与自动续期与配额统计；创建 zone 请用「一键委派到 Cloudflare」，删除 zone 仍请前往 Cloudflare 控制台。
 
 ### 绑定 Cloudflare 账号需要什么权限？
 
 API Token 需含 `Zone:Read` 与 `Zone DNS:Edit`，作用范围建议覆盖要管理的域名。绑定时会调 `user/tokens/verify` 在线校验，无效或已禁用的 Token 不入库；同一 Cloudflare 账号不可重复绑定。
+
+「一键委派到 Cloudflare」还要调用 `POST /zones` 创建 zone —— Cloudflare 官方文档标注该接口接受 `Zone:Edit` 或 `Zone DNS:Edit` 之一。若委派时报权限不足，给 Token 补上 `Zone:Edit` 即可。注意委派只把 **NS 记录写回 DNSHE**，解析记录仍是你在第二步确认后才写入 Cloudflare。
+
+### 为什么有些根域名不能一键委派？
+
+Cloudflare 用 Public Suffix List（PSL）区分「可注册的根域」与「子域」。只有当你的根域本身被列入 PSL，`x.你的根域` 才算一个根域，免费版才能为它建 zone 并把 NS 委派过去；否则 Cloudflare 视其为子域，Free / Pro 会直接拒绝（真正意义上的子域委派是 Enterprise 专属）。DNSHE 提供的根域里目前只有 `us.ci` / `cc.cd` / `de5.net` / `ccwu.cc` 在 PSL 内，所以面板只对这 4 个根开放委派，其余根域的菜单项会置灰并显示具体原因。
 
 ---
 
@@ -391,6 +398,7 @@ API Token 需含 `Zone:Read` 与 `Zone DNS:Edit`，作用范围建议覆盖要�
 - 运行日志页
 - API 密钥集中管理（表格化与增量缓存）
 - 域名助力与助力记录（并行化、排除名单）
+- 一键委派域名到 Cloudflare（先委派、后列出记录让用户确认；仅对 PSL 内的根域开放）
 - Worker 子请求预算与定时同步的轮转调度
 - 一批请求竞态、可选链空值与数值解析的健壮性修复
 
