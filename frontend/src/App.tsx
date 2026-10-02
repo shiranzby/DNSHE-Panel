@@ -2131,6 +2131,15 @@ export default function App() {
     ? SETTINGS_SECTIONS.filter((s) => s.keywords.toLowerCase().includes(settingsSearchKw)).length
     : SETTINGS_SECTIONS.length;
 
+  /* 设置页两列布局的列可见性：整列都被搜索过滤掉时，列容器本身也要 hidden ——
+     否则 grid 会留下一个空列（右列被顶到第二格，左边空一半）。 */
+  const settingsLeftColVisible = ["settings-backend", "settings-security", "settings-renew"].some((id) =>
+    settingsSectionVisible(id)
+  );
+  const settingsRightColVisible = ["settings-line-ns", "settings-notify"].some((id) =>
+    settingsSectionVisible(id)
+  );
+
   /**
    * 跳到设置页某个小节（抽屉二级菜单用）
    *
@@ -10756,11 +10765,17 @@ export default function App() {
                   </p>
                 </div>
               )}
-              {/* 桌面端用 CSS 多列做瀑布流：卡片沿列依次填满。
-                  原来用 grid 两列时，每行的高度由该行最高的一张卡决定 ——
-                  草稿里「后端地址」很短而「账户安全」很高，于是左列下方出现大片空白。
-                  columns 布局是纵向流动的，天然没有这个问题。 */}
-              <div className="lg:columns-2 lg:gap-6 space-y-5 sm:space-y-6 lg:space-y-0">
+              {/* 桌面端两列：每列各自是一根纵向 flex 柱，卡片之间用父级 gap 留白。
+                  🔴 不能用 `space-y-*` 做间距：Tailwind 的 space-y 会给「所有非首元素」
+                  注入 `margin-bottom: 0`，把卡片自己的 `mb-6` 覆盖掉 —— 实测「账户安全 →
+                  自动续期」与「解析线路支持名单 → 通知渠道」的间距因此都变成 0px。
+                  也不能用 CSS 多列（columns-2）：那是瀑布流，两列高度天然不齐
+                  （实测 1440 下差 191px），做不到「两列底部对齐」。
+                  现在 grid 两列 + 每列 flex-col + 末卡 `lg:flex-1` 吸收剩余高度 ⇒ 两列底部齐平。
+                  搜索过滤时降为单列：整列被过滤掉的列容器会 hidden，避免留一个空列。 */}
+              <div className={`grid grid-cols-1 gap-5 sm:gap-6 items-stretch ${isSettingsSearchActive ? "" : "lg:grid-cols-2"}`}>
+                {/* 左列：后端地址 / 账户安全 / 自动续期 */}
+                <div className={`flex flex-col gap-5 sm:gap-6 ${settingsLeftColVisible ? "" : "hidden"}`}>
                 {/* NOTE: 这里原有一个「外观 / 主题模式」卡片，与顶栏的太阳/月亮切换按钮
                     完全同源（都改 theme 这一个 state），属重复入口，已移除。
                     主题切换保留在顶栏，任何页面都能直接点到，不必先进设置页。 */}
@@ -10768,7 +10783,7 @@ export default function App() {
                 {/* 后端地址 */}
                 <div
                   id="settings-backend"
-                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-backend") ? "" : "hidden"}`}
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4 ${settingsSectionVisible("settings-backend") ? "" : "hidden"}`}
                 >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Server className="w-4 h-4 text-indigo-400" /> 后端地址
@@ -10836,7 +10851,7 @@ export default function App() {
                 {/* 账户安全：修改密码 + 两步验证 */}
                 <div
                   id="settings-security"
-                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-5 ${settingsSectionVisible("settings-security") ? "" : "hidden"}`}
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-5 ${settingsSectionVisible("settings-security") ? "" : "hidden"}`}
                 >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <ShieldCheck className="w-4 h-4 text-emerald-400" /> 账户安全
@@ -11027,7 +11042,7 @@ export default function App() {
                 {/* 自动续期 */}
                 <div
                   id="settings-renew"
-                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-renew") ? "" : "hidden"}`}
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:flex-1 space-y-4 ${settingsSectionVisible("settings-renew") ? "" : "hidden"}`}
                 >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <RefreshCw className="w-4 h-4 text-emerald-400" /> 自动续期
@@ -11055,11 +11070,17 @@ export default function App() {
                     />
                   </div>
                 </div>
+                </div>
+
+                {/* 右列：解析线路支持名单 / 通知渠道（这两张卡最长，放同一列）
+                    NOTE: 卡片自身的缩进没有跟着列容器再加一级 —— 只补了包裹标签。
+                          重排这 500 行的缩进会让本轮 diff 完全失去可读性。 */}
+                <div className={`flex flex-col gap-5 sm:gap-6 ${settingsRightColVisible ? "" : "hidden"}`}>
 
                 {/* 解析线路支持名单 */}
                 <div
                   id="settings-line-ns"
-                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-line-ns") ? "" : "hidden"}`}
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4 ${settingsSectionVisible("settings-line-ns") ? "" : "hidden"}`}
                 >
                   {/*
                     NOTE: 「恢复默认」原来跟输入框、添加按钮挤在同一个表单行里 —— 它是**整份覆盖名单**
@@ -11189,7 +11210,7 @@ export default function App() {
                 {/* 通知 */}
                 <div
                   id="settings-notify"
-                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:mb-6 break-inside-avoid space-y-4 ${settingsSectionVisible("settings-notify") ? "" : "hidden"}`}
+                  className={`bg-surface border border-border-base rounded-2xl p-4 sm:p-5 lg:flex-1 space-y-4 ${settingsSectionVisible("settings-notify") ? "" : "hidden"}`}
                 >
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
                     <Bell className="w-4 h-4 text-amber-400" /> 通知渠道
@@ -11342,9 +11363,10 @@ export default function App() {
                     </p>
                   </div>
                 </div>
+                </div>
 
               </div>
-                {/* 保存按钮：移出瀑布流（columns 布局里 col-span 无效），始终横跨整行停在底部 */}
+                {/* 保存按钮：放在两列容器外面，始终横跨整行停在底部 */}
                 <div className="flex justify-end">
                   <button
                     onClick={handleSaveSettings}
