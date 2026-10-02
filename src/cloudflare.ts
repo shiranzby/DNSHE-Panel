@@ -67,6 +67,20 @@ export interface CfAccountInfo {
   name: string;
 }
 
+/**
+ * zone 创建结果
+ *
+ * NOTE: 只保留「域名委派」流程真正要用的三个字段：新 zone 的 id、CF 分配的两台 NS、
+ * 以及 zone 状态。status 建出来必然是 `pending` —— 官方文档明确「zone 创建后处于
+ * pending，必须把域名 NS 指过来（或完成 partial 校验）才会 active」。
+ */
+export interface CfZoneCreateResult {
+  id: string;
+  name: string;
+  status: string;
+  name_servers: string[];
+}
+
 /** DNS 记录写接口参数 —— 路由层从请求体摊平后构造，name 允许相对名/完整名/@ */
 export interface CfDnsWriteParams {
   zone_id: string;
@@ -256,6 +270,46 @@ export class CloudflareClient {
       page++;
     }
     return zones;
+  }
+
+  /**
+   * 在指定账号下创建一个 full setup zone（「域名委派到 Cloudflare」第一步）
+   *
+   * 🔴 前置条件由调用方保证：只有「可注册根域名」才建得成。Cloudflare 用 Public
+   *    Suffix List 判根域/子域 —— x.<root> 只有在 <root> 本身是 public suffix 时
+   *    才算根域（免费版可建 full zone + 委派 NS）；否则 CF 视为子域，Free/Pro 直接
+   *    拒绝，真委派要 Enterprise。DNSHE 的 9 个根里只有 4 个在 PSL 里。
+   *
+   * NOTE: 三个刻意的取舍
+   *   · `type: "full"` —— 本 zone 的权威解析交给 Cloudflare，这正是「委派」的含义；
+   *     partial（CNAME 接入）会保留原权威 DNS，与委派语义不符。
+   *   · 不传 `jump_start` —— 那会让 CF 自己去扫旧解析并预填记录，结果不可预期；
+   *     记录迁移必须走「用户确认后显式写入」，见 /api/domains/:id/delegate-cloudflare。
+   *   · 不读 `vanity_name_servers` —— 自定义 NS 是 Business+ 专属，本项目不涉及。
+   */
+  async createZone(name: string, accountId: string | number): Promise<CfZoneCreateResult> {
+    const result = await this.request<CfZoneInfo>("POST", "/zones", undefined, {
+      name: String(name || "").trim().toLowerCase(),
+      account: { id: String(accountId ?? "").trim() },
+      type: "full",
+    });
+    return {
+      id: String(result.id),
+      name: result.name || name,
+      status: result.status || "pending",
+      name_servers: (result.name_servers || []).map((host) => String(host)),
+    };
+  }
+
+  /**
+   * 读取单个 zone 的当前状态
+   *
+   * NOTE: 给「刷新状态」用。委派写完之后 CF 要自己去父区查 NS 才会把 zone 从
+   * pending 翻成 active，这个检测是异步的（分钟级），所以不做阻塞轮询 ——
+   * 用户点一次刷新就问一次，成本 1 个子请求。
+   */
+  async getZone(zoneId: string | number): Promise<CfZoneInfo> {
+    return this.request<CfZoneInfo>("GET", `/zones/${encodeURIComponent(String(zoneId))}`);
   }
 
   /**

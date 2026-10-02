@@ -4,8 +4,8 @@ import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
 import type { DBDomain } from "./db";
 import { DNSHEClient } from "./dnshe";
-import type { ApiKeyInfo, CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
-import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
+import type { ApiKeyInfo, CreateDnsRecordParams, DnsRecordInfo, UpdateDnsRecordParams } from "./dnshe";
+import { CloudflareClient, mapZoneToUpstream, zoneIdToNumericId } from "./cloudflare";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, syncOneAccountDomains, sendTelegramNotification, sendWebhookNotification, sendSmtpMail, SYNC_SUBREQUEST_BUDGET } from "./cron";
 import type { WebhookType } from "./cron";
 import { computeDnsState } from "./dns-provider";
@@ -1365,6 +1365,263 @@ app.post("/api/domains/:id/delete", async (c) => {
     const raw = e instanceof Error ? e.message : "未知错误";
     return c.json(errorRes(translateDeleteError(raw)), 400);
   }
+});
+
+// ────────────────────────── 3.9 一键委派到 Cloudflare ──────────────────────────
+
+/**
+ * 可一键委派到 Cloudflare 的根域名白名单
+ *
+ * 🔴 准入判据是 **Public Suffix List**，不是「域名有几个点」。Cloudflare 用 PSL
+ *    区分「可注册根域」与「子域」：`x.<root>` 只有 `<root>` 本身是 public suffix
+ *    时才被 CF 当成根域，免费版才能建 full setup zone 并把 NS 委派过去；否则 CF
+ *    视为子域，Free/Pro 直接拒绝（真委派要 Enterprise）。
+ *
+ * 实测这 4 个根已由 DNSHE 提交进 PSL 的 PRIVATE 段（标注 `DNSHE : https://www.dnshe.com`）：
+ *    us.ci / cc.cd / de5.net / ccwu.cc
+ * 另 5 个（l.cd / cn.mt / bot.cd / ddns.ge / bbroot.com）不在 PSL 里 ⇒ 不可委派。
+ * 复核脚本：`dnshe-deploy/.apitmp/psl-check.py`（每次重拉 PSL，不信任本地副本）。
+ *
+ * ⚠️ 前端 `frontend/src/App.tsx` 的 `CF_DELEGATABLE_ROOTS` 是本表的镜像，只用于
+ *    「菜单项禁用 + 给出原因」的渲染；**准入判定以后端为准**（前端被绕过也进不来）。
+ *    两处必须同步，`.apitmp/verify-r19.mjs` 会直接读两个源文件比对集合。
+ */
+const CF_DELEGATABLE_ROOTS = ["us.ci", "cc.cd", "de5.net", "ccwu.cc"];
+
+/** 判断一个 DNSHE 域名的根是否在白名单内（命中则返回命中的那个根） */
+function findDelegatableRoot(fullDomain: string, rootdomain: string): string | null {
+  const root = String(rootdomain || "").trim().toLowerCase();
+  const full = String(fullDomain || "").trim().toLowerCase();
+  // 用「等值 or 后缀」两条路判断：上游 rootdomain 实测是单级，但白名单以后可能
+  // 出现多级根（如 a.b.ci），后缀匹配对两种情况都成立。
+  return CF_DELEGATABLE_ROOTS.find((r) => root === r || full === r || full.endsWith(`.${r}`)) || null;
+}
+
+/**
+ * 一键把 DNSHE 域名委派到 Cloudflare
+ *
+ * 顺序是**刻意**的（用户 2026-10-02 定稿「先委派、把记录列出来让人确认」）：
+ *   ① 根域准入（PSL 白名单）→ ② 选 CF 账号 → ③ **只读**快照现有解析记录
+ *   → ④ 建 zone（幂等）→ ⑤ 清 apex 上的非 NS 冲突记录 → ⑥ 串行写 CF 的两台 NS
+ *   → ⑦ 把新 zone 登记进本地库 → ⑧ 返回「待迁移记录清单」让人确认
+ *
+ * 🔴 **本路由不会把任何一条解析记录写进 Cloudflare**。记录迁移由用户在弹窗里
+ *    勾选确认后，走现成的 `POST /api/domains/:zoneNumericId/dns/batch` 完成。
+ *    理由：CF 新建 zone 时若 `jump_start` 自动扫解析，结果不可预期；委派后原解析
+ *    会立即失效，**必须让用户看清「哪些记录即将被重建」再落笔**。
+ */
+app.post("/api/domains/:id/delegate-cloudflare", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+  let body: Record<string, unknown> = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    body = {};
+  }
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  const domainInfo = await dbManager.getDomainById(domainId);
+  if (!domainInfo) {
+    return c.json(errorRes("未找到域名记录", "not_found"), 404);
+  }
+
+  // ① 根域准入：另 5 个根 CF 建不了 zone。挡在这里而不是"发出去再看 403" ——
+  //    省一次必然失败的上游往返，也给前端一个能直接展示的原因。
+  const matchedRoot = findDelegatableRoot(domainInfo.full_domain, domainInfo.rootdomain);
+  if (!matchedRoot) {
+    return c.json(
+      errorRes(
+        `根域名 ${domainInfo.rootdomain} 不支持委派到 Cloudflare：它不在 Public Suffix List 里，` +
+          `Cloudflare 会把 ${domainInfo.full_domain} 判为子域名，免费/Pro 版不允许为其创建 zone（需 Enterprise）。`,
+        "root_not_delegatable"
+      ),
+      400
+    );
+  }
+
+  // 目标是 DNSHE 域名才谈得上「委派出去」；CF zone 行本身已经在 Cloudflare 上了
+  const { client: dnsheClient } = await dbManager.getClientForAccount(domainInfo.account_id);
+  if (!(dnsheClient instanceof DNSHEClient)) {
+    return c.json(errorRes("该域名已经是 Cloudflare 上的 zone，无需再次委派", "already_on_cloudflare"), 400);
+  }
+
+  // ② 选目标 CF 账号：显式指定 > 只有唯一一个 > 让前端选
+  const cfAccounts = (await dbManager.getAccounts()).filter((a) => a.provider === "cloudflare");
+  const rawCfId = body.cf_account_id;
+  const requestedCfId =
+    rawCfId === undefined || rawCfId === null || rawCfId === "" ? null : parseInt(String(rawCfId), 10);
+  let cfAccount = requestedCfId ? cfAccounts.find((a) => a.id === requestedCfId) : undefined;
+  if (!cfAccount && requestedCfId === null && cfAccounts.length === 1) {
+    cfAccount = cfAccounts[0];
+  }
+  if (!cfAccount) {
+    return c.json(
+      errorRes(
+        cfAccounts.length === 0
+          ? "还没有绑定任何 Cloudflare 账号。请先到「账号管理」绑定一个 API Token（需 Zone:Read + Zone DNS:Edit 权限）。"
+          : "请选择要把该域名委派到哪个 Cloudflare 账号。",
+        cfAccounts.length === 0 ? "cf_account_missing" : "cf_account_required"
+      ),
+      400
+    );
+  }
+  const { client: cfClient } = await dbManager.getClientForAccount(cfAccount.id);
+  if (!(cfClient instanceof CloudflareClient)) {
+    return c.json(errorRes("选中的账号不是 Cloudflare 账号", "cf_account_required"), 400);
+  }
+
+  // ③ 只读快照。放在任何写操作之前：一旦后面失败，用户手里还有完整的记录底稿。
+  //    读失败直接中止（改动量为 0），不要在"不知道自己有什么"的状态下动 DNS。
+  let snapshot: DnsRecordInfo[] = [];
+  try {
+    const dnsRes = await dnsheClient.listDnsRecords(domainId);
+    if (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) snapshot = dnsRes.records;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "未知错误";
+    return c.json(
+      errorRes(`读取 ${domainInfo.full_domain} 的现有解析记录失败，为避免误删，本次未做任何改动：${msg}`, "snapshot_failed"),
+      400
+    );
+  }
+
+  // ④ 建 zone。放在删记录**之前** —— 建失败时 DNSHE 侧一个字节都没动。
+  //    同名 zone 已存在（CF code 1061）不算失败：直接找回来复用，
+  //    否则用户只要在 CF 侧手动建过一次，就永远走不通这个流程。
+  let zone: { id: string; name: string; status: string; name_servers: string[] };
+  let zoneReused = false;
+  try {
+    zone = await cfClient.createZone(domainInfo.full_domain, cfAccount.id);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "创建 zone 失败";
+    const existing = /already exists|1061/i.test(msg)
+      ? (await cfClient.listZones()).find((z) => String(z.name || "").toLowerCase() === domainInfo.full_domain.toLowerCase())
+      : undefined;
+    if (!existing) {
+      return c.json(
+        errorRes(`在 Cloudflare 创建 zone 失败（DNSHE 侧记录未改动）：${msg}`, "zone_create_failed"),
+        400
+      );
+    }
+    zone = {
+      id: existing.id,
+      name: existing.name,
+      status: existing.status || "pending",
+      name_servers: (existing.name_servers || []).map((h) => String(h)),
+    };
+    zoneReused = true;
+  }
+
+  // 拿不到 NS 就别往下走（此时仍未删任何记录）
+  const nsHosts = zone.name_servers.slice(0, 2);
+  if (nsHosts.length === 0) {
+    return c.json(
+      errorRes("Cloudflare 未返回该 zone 的名称服务器，无法完成委派。请稍后重试。", "no_name_servers"),
+      400
+    );
+  }
+
+  // ⑤ 清掉 apex 上的非 NS 记录：NS 落在 `@` 上，与同名的 A/CNAME/TXT 冲突，
+  //    上游会直接拒绝写入。**只动 apex** —— 非 apex 记录原样留在 DNSHE，
+  //    它们从委派生效起不再被解析，但作为"万一要退回"的底稿比删掉安全得多。
+  const apexConflicts = snapshot.filter((r) => {
+    const type = String(r.type || "").toUpperCase();
+    if (type === "NS") return false;
+    const name = String(r.name || "").trim().toLowerCase().replace(/\.$/, "");
+    return name === "" || name === "@" || name === domainInfo.full_domain.toLowerCase();
+  });
+  const removed: string[] = [];
+  const removeFailed: string[] = [];
+  for (const rec of apexConflicts) {
+    const label = `${rec.type} ${rec.name} → ${rec.content}`;
+    try {
+      const res = await dnsheClient.deleteDnsRecord(domainId, rec.id ?? rec.record_id ?? "");
+      if (res && res.success) removed.push(label);
+      else removeFailed.push(label);
+    } catch {
+      removeFailed.push(label);
+    }
+  }
+  if (removeFailed.length > 0) {
+    // 删不掉就停手：带着冲突记录写 NS 必然失败，继续做只会顺手把记录删一半。
+    return c.json(
+      errorRes(
+        `apex 上有 ${removeFailed.length} 条记录删除失败，已停止委派（避免只删一半）：${removeFailed.join("；")}`,
+        "conflict_remove_failed"
+      ),
+      400
+    );
+  }
+
+  // ⑥ 串行写 NS。上游一次只收一条且有限频，逐条提交、单条失败不中断，
+  //    最后统一汇报 —— 避免"写了一条却什么都没说"。
+  const nsWritten: string[] = [];
+  const nsFailed: Array<{ ns: string; msg: string }> = [];
+  let nsDisabled = false;
+  for (const ns of nsHosts) {
+    try {
+      const res = await dnsheClient.createDnsRecord({
+        subdomain_id: domainId,
+        type: "NS",
+        name: "@",
+        content: ns,
+        ttl: 86400,
+      });
+      if (res && res.success) nsWritten.push(ns);
+      else nsFailed.push({ ns, msg: res?.message || "写入失败" });
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : "请求异常";
+      const { message, errorCode } = translateDnsWriteError(raw, "NS");
+      if (errorCode === "ns_management_disabled") nsDisabled = true;
+      nsFailed.push({ ns, msg: message });
+    }
+    await sleep(DNS_BATCH_INTERVAL);
+  }
+
+  // ⑦ 把新 zone 登记进 domains_cache，让「记录迁移」那一步能复用现成的
+  //    POST /api/domains/:id/dns/batch（它按账号 provider 自动分发到 CF 客户端）。
+  //    ⚠️ 必须走 syncCloudflareZones（整账号列表）而非只 upsert 这一条：
+  //    syncAccountDomains 会删除「本次列表里没有」的缓存行，只喂一条会把该账号
+  //    其它 zone 全部抹掉。
+  if (nsWritten.length > 0) {
+    try {
+      await syncCloudflareZones(dbManager, cfAccount.id, cfClient);
+    } catch (e) {
+      console.error("委派后登记 CF zone 失败:", e);
+    }
+  }
+
+  // ⑧ 待迁移清单：跳过 NS / SOA —— CF 新 zone 自带这两类，重复写必然冲突
+  const migratable = snapshot.filter((r) => !["NS", "SOA"].includes(String(r.type || "").toUpperCase()));
+
+  await dbManager.writeLog(
+    nsFailed.length === 0 ? "success" : "warning",
+    "operation",
+    `域名 [${domainInfo.full_domain}] 委派到 Cloudflare（账号 ${cfAccount.alias}）` +
+      `${zoneReused ? "复用已有 zone" : "新建 zone"} ${zone.id}：写入 NS ${nsWritten.length}/${nsHosts.length} 条，` +
+      `清理 apex 冲突 ${removed.length} 条，待迁移记录 ${migratable.length} 条`,
+    { removed, nsWritten, nsFailed }
+  );
+
+  return c.json(
+    successRes({
+      zone_id: zone.id,
+      zone_numeric_id: zoneIdToNumericId(zone.id),
+      zone_status: zone.status,
+      zone_reused: zoneReused,
+      name_servers: nsHosts,
+      ns_written: nsWritten,
+      ns_failed: nsFailed,
+      ns_management_disabled: nsDisabled,
+      removed_records: removed,
+      records: migratable,
+      cf_account_id: cfAccount.id,
+      cf_account_alias: cfAccount.alias,
+    })
+  );
 });
 
 // 4. 获取子域名下所有的 DNS 解析记录 (代理接口)

@@ -390,6 +390,32 @@ const DEFAULT_LINE_NS_SUFFIXES = ["alidns.com"];
 const DEFAULT_LINE_PROVIDERS = ["1"];
 
 /**
+ * 可一键委派到 Cloudflare 的根域名名单
+ *
+ * 🔴 判据是 **Public Suffix List**，不是「域名有几个点」。Cloudflare 用它区分
+ * 「可注册根域」和「子域」：`x.<root>` 只有当 `<root>` 本身是 public suffix 时
+ * 才算根域，免费版才能为它建 full setup zone 并把 NS 委派过去；否则 CF 视其为
+ * 子域，Free/Pro 直接拒绝（真委派要 Enterprise）。
+ *
+ * DNSHE 的 9 个根里只有这 4 个进了 PSL 的 PRIVATE 段（提交者标注
+ * `DNSHE : https://www.dnshe.com`）：us.ci / cc.cd / de5.net / ccwu.cc；
+ * 另外 5 个（l.cd / cn.mt / bot.cd / ddns.ge / bbroot.com）不在 PSL 里。
+ * 复核脚本：`dnshe-deploy/.apitmp/psl-check.py`（每次重拉 PSL，不信任本地副本）。
+ *
+ * ⚠️ 本表是后端 `src/index.ts` 的 `CF_DELEGATABLE_ROOTS` 的**镜像**，只用来决定
+ * 菜单项「可用 / 禁用 + 原因」的渲染；**真正的准入判定在后端**（前端被绕过也进不来）。
+ * 两处必须同步，`.apitmp/verify-r19.mjs` 会直接读两个源文件比对集合。
+ */
+const CF_DELEGATABLE_ROOTS = ["us.ci", "cc.cd", "de5.net", "ccwu.cc"];
+
+/** 该域名的根是否可委派（命中则返回命中的根，否则 null） */
+const matchDelegatableRoot = (dom: { full_domain: string; rootdomain: string }): string | null => {
+  const root = String(dom.rootdomain || "").trim().toLowerCase();
+  const full = String(dom.full_domain || "").trim().toLowerCase();
+  return CF_DELEGATABLE_ROOTS.find((r) => root === r || full === r || full.endsWith(`.${r}`)) || null;
+};
+
+/**
  * 解析线路下拉框
  *
  * NOTE: 不支持线路的域名是「禁用」而不是隐藏 —— 一是保持表单网格对齐，二是上游对
@@ -1020,6 +1046,32 @@ export default function App() {
     ttl: true,
     proxied: false
   });
+
+  // ── 一键委派到 Cloudflare（第19轮）──
+  // 两阶段：confirm（确认 + 选 CF 账号）→ records（列出待迁移记录让人确认）
+  // 阶段划分是刻意的：委派写操作先做完，记录迁移必须由人逐条过目后才落笔
+  const [delegateDomain, setDelegateDomain] = useState<Domain | null>(null);
+  const [delegateStep, setDelegateStep] = useState<"confirm" | "records">("confirm");
+  const [delegateCfAccountId, setDelegateCfAccountId] = useState<string>("");
+  const [delegateLoading, setDelegateLoading] = useState(false);
+  // 后端返回的业务原因就地展示（不弹 toast），用户需要照着原因改 Token / 换账号
+  const [delegateError, setDelegateError] = useState("");
+  const [delegateResult, setDelegateResult] = useState<{
+    zone_id: string;
+    zone_numeric_id: number;
+    zone_status: string;
+    zone_reused: boolean;
+    name_servers: string[];
+    ns_written: string[];
+    ns_failed: Array<{ ns: string; msg: string }>;
+    ns_management_disabled: boolean;
+    removed_records: string[];
+    records: DnsRecord[];
+    cf_account_alias: string;
+  } | null>(null);
+  // 勾选用「记录在清单里的下标」作键：清单拿到后就冻结，下标即稳定标识
+  const [delegateSelectedKeys, setDelegateSelectedKeys] = useState<Set<string>>(new Set());
+  const [delegateApplyResults, setDelegateApplyResults] = useState<Array<{ label: string; success: boolean; message: string }> | null>(null);
   const [cfBatchEditTtl, setCfBatchEditTtl] = useState(1);
   const [cfBatchEditProxied, setCfBatchEditProxied] = useState(false);
   const [cfBatchEditContents, setCfBatchEditContents] = useState<Record<string, string>>({});
@@ -1700,6 +1752,21 @@ export default function App() {
   const renderDomainCard = (dom: Domain) => {
     const unicodeDomain = displayDomain(toUnicode(dom.full_domain));
 
+    // ── 一键委派到 Cloudflare 的准入判定（第19轮）──
+    // 三重门：① CF zone 行本身不是 DNSHE 域名，压根不渲染这个入口；
+    // ② 已经委派到 CF 的没必要再来一次；③ 根域名不在 PSL 白名单里的，
+    // Cloudflare 根本建不了 zone —— 渲染成**禁用并当场说明原因**，
+    // 而不是让人点下去才报错（用户要求「遇到了不支持的就提示禁用」）。
+    // 真正的准入判定在后端（前端被绕过也进不来），这里只管"让用户看得懂"。
+    const isCfZoneRow = dom.account_provider === "cloudflare";
+    const delegatableRoot = matchDelegatableRoot(dom);
+    const alreadyOnCloudflare = !checkHasDns(dom) && getDnsProviderLabel(dom) === "Cloudflare";
+    const delegateBlockReason = alreadyOnCloudflare
+      ? "该域名已委派到 Cloudflare"
+      : !delegatableRoot
+        ? `根域名 ${dom.rootdomain} 不在 Public Suffix List，CF 视其为子域名（需企业版）`
+        : "";
+
     return (
       <div
         key={dom.id}
@@ -1794,7 +1861,7 @@ export default function App() {
           {openActionMenuId === dom.id && (
             <div 
               onClick={(e) => e.stopPropagation()}
-              className="absolute right-0 bottom-10 z-30 w-40 bg-elevated border border-border-base rounded-xl shadow-2xl overflow-hidden text-xs py-1 animate-in fade-in zoom-in-95"
+              className="absolute right-0 bottom-10 z-30 w-52 bg-elevated border border-border-base rounded-xl shadow-2xl overflow-hidden text-xs py-1 animate-in fade-in zoom-in-95"
             >
               <button
                 onClick={() => {
@@ -1805,6 +1872,40 @@ export default function App() {
               >
                 <Server className="w-3.5 h-3.5 text-content-muted" /> 修改 NS 记录
               </button>
+
+              {/* 一键委派到 Cloudflare —— 不支持的根域禁用并把原因写在下面
+                  （只给 title 的话手机上根本没有悬停，看不见原因） */}
+              {!isCfZoneRow && (
+                <button
+                  onClick={() => {
+                    if (delegateBlockReason) return;
+                    setOpenActionMenuId(null);
+                    handleOpenDelegateModal(dom);
+                  }}
+                  disabled={!!delegateBlockReason}
+                  data-delegatable={delegateBlockReason ? "0" : "1"}
+                  title={delegateBlockReason || `把 ${dom.full_domain} 委派到 Cloudflare`}
+                  className={`w-full text-left px-3.5 py-2.5 flex items-start gap-2 border-t border-border-base ${
+                    delegateBlockReason
+                      ? "text-content-muted opacity-60 cursor-not-allowed"
+                      : "hover:bg-hovered text-content-secondary hover:text-content-primary"
+                  }`}
+                >
+                  <CloudflareIcon
+                    className={`w-3.5 h-3.5 flex-shrink-0 mt-0.5 ${
+                      delegateBlockReason ? "text-content-muted" : "text-sky-500"
+                    }`}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block">委派到 Cloudflare</span>
+                    {delegateBlockReason && (
+                      <span className="block mt-0.5 text-[11px] leading-snug text-content-muted whitespace-normal">
+                        {delegateBlockReason}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              )}
               
               <button
                 onClick={() => {
@@ -3336,6 +3437,129 @@ export default function App() {
     } finally {
       setLoadingNsModal(false);
     }
+  };
+
+  // ─────────────────── 一键委派到 Cloudflare（第19轮）───────────────────
+  //
+  // 为什么是两阶段、且**先委派后迁记录**（用户 2026-10-02 定稿）：
+  //   委派（建 zone + 改 NS）与记录迁移是两件独立的事。若在委派前就把记录抄进 CF，
+  //   抄错或抄串了用户根本没有反驳的机会；反过来先委派、再把「从 DNSHE 读到的原始
+  //   记录清单」摊开让人逐条勾选确认，任何一条不该过去的记录都能当场划掉。
+  //   代价是委派生效到记录写入之间有一段解析真空 —— 所以确认框里必须写清楚。
+
+  // 打开委派弹窗（重置两阶段状态，避免上一次的残留串到这一次）
+  const handleOpenDelegateModal = (dom: Domain) => {
+    setDelegateDomain(dom);
+    setDelegateStep("confirm");
+    setDelegateError("");
+    setDelegateResult(null);
+    setDelegateSelectedKeys(new Set());
+    setDelegateApplyResults(null);
+    // 只绑定了一个 CF 账号就预选，省一次点击；绑了多个才让用户显式挑
+    setDelegateCfAccountId(cfAccounts.length === 1 ? String(cfAccounts[0].id) : "");
+  };
+
+  // 阶段一：建 zone + 写 NS（全部在后端一次完成），拿回「待迁移记录清单」
+  const handleStartDelegate = async () => {
+    if (!delegateDomain) return;
+    setDelegateLoading(true);
+    setDelegateError("");
+    try {
+      const res = await apiFetch(`/api/domains/${delegateDomain.id}/delegate-cloudflare`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cf_account_id: delegateCfAccountId || undefined })
+      });
+      const data = await res.json();
+      if (!data.success) {
+        // 就地展示原因（Token 缺权限 / 根域不支持 / 没绑账号），不弹 toast ——
+        // 用户需要边看原因边改设置，toast 几秒就没了
+        setDelegateError(data.message || "委派失败");
+        return;
+      }
+      setDelegateResult(data);
+      // 默认全选：委派的目的是把解析搬过去，逐条取消比逐条勾选常见得多
+      setDelegateSelectedKeys(new Set((data.records || []).map((_: DnsRecord, i: number) => String(i))));
+      setDelegateStep("records");
+      const nsFailed: Array<{ ns: string }> = data.ns_failed || [];
+      showToast(
+        nsFailed.length === 0 ? "success" : "warning",
+        nsFailed.length === 0
+          ? `已${data.zone_reused ? "复用" : "创建"} Cloudflare zone，写入 ${data.ns_written.length} 条 NS，委派已提交`
+          : `已创建 zone，但 ${nsFailed.length} 条 NS 写入失败，委派尚未生效`
+      );
+      // DNSHE 侧记录被清理、NS 已变，本地列表的三态过时了，顺手同步一次
+      handleSyncDomains();
+    } catch (e) {
+      setDelegateError("委派请求发生网络异常");
+    } finally {
+      setDelegateLoading(false);
+    }
+  };
+
+  // 阶段二：把用户勾选的记录重建到刚建好的 CF zone
+  // 复用现成的批量创建接口 —— 它按域名所属账号的 provider 自动分发到 Cloudflare 客户端
+  const handleApplyDelegateRecords = async () => {
+    if (!delegateResult) return;
+    const rows = delegateResult.records || [];
+    const picked = rows.filter((_, i) => delegateSelectedKeys.has(String(i)));
+    if (picked.length === 0) {
+      showToast("warning", "没有勾选任何记录，未写入 Cloudflare");
+      return;
+    }
+    setDelegateLoading(true);
+    try {
+      const res = await apiFetch(`/api/domains/${delegateResult.zone_numeric_id}/dns/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          records: picked.map((r) => ({
+            type: r.type,
+            name: r.name,
+            content: r.content,
+            // CF 以 ttl=1 表示「自动」，这里原样透传；缺 TTL 的老记录给 600 兜底
+            ttl: Number(r.ttl) > 0 ? Number(r.ttl) : 600,
+            priority: r.priority ?? undefined
+          }))
+        })
+      });
+      const data = await res.json();
+      if (!data.success) {
+        showToast("error", data.message || "写入 Cloudflare 失败");
+        return;
+      }
+      setDelegateApplyResults(data.results || []);
+      // §8：收尾必须说清「做了多少 / 成功几个 / 几个没做完」
+      const ok = Number(data.success_count) || 0;
+      const bad = Number(data.fail_count) || 0;
+      showToast(
+        bad === 0 ? "success" : "warning",
+        bad === 0
+          ? `已把 ${ok} 条解析记录重建到 Cloudflare，委派完成`
+          : `已重建 ${ok} 条，${bad} 条失败 —— 可对照下方原因处理后重试`
+      );
+      fetchDomains();
+    } catch (e) {
+      showToast("error", "写入 Cloudflare 发生网络异常");
+    } finally {
+      setDelegateLoading(false);
+    }
+  };
+
+  // 逐条勾选 / 全选（清单冻结后下标即稳定键）
+  const toggleDelegateRecord = (key: string) =>
+    setDelegateSelectedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
+  const toggleAllDelegateRecords = () => {
+    const total = delegateResult?.records?.length ?? 0;
+    setDelegateSelectedKeys((prev) =>
+      prev.size === total ? new Set() : new Set(Array.from({ length: total }, (_, i) => String(i)))
+    );
   };
 
   // 一键恢复为系统默认 NS / 清理残留 NS 记录（两者都是删除区域内的 NS 解析记录）
@@ -12120,6 +12344,373 @@ export default function App() {
                 )}
                 确认删除
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── 一键委派到 Cloudflare（第19轮）──
+          两阶段形状：① 确认 + 选 CF 账号（写操作都发生在这里）→ ② 列出从 DNSHE
+          读到的原始记录让人逐条确认。顺序是「先委派、再列记录」——用户 2026-10-02
+          定的：抄记录之前先把委派做完，用户才有机会对着真实清单划掉不该过去的条目。
+          代价是委派生效到记录写回之间有一段解析真空，所以第一阶段必须把代价说透。 */}
+      {delegateDomain && (
+        <div
+          data-deleg-modal="1"
+          className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md"
+        >
+          <div className="bg-surface border border-border-base w-full max-w-2xl max-h-[90dvh] rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+            {/* 模态框头部 */}
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
+              <div className="min-w-0">
+                <h3 className="text-base sm:text-lg font-bold text-content-primary flex items-center gap-2">
+                  <CloudflareIcon className="text-sky-400 w-5 h-5 flex-shrink-0" />
+                  <span className="truncate">委派到 Cloudflare</span>
+                </h3>
+                <p className="text-xs text-content-muted mt-0.5 font-mono truncate">
+                  域名: {delegateDomain.full_domain}
+                </p>
+              </div>
+              <button
+                onClick={() => setDelegateDomain(null)}
+                aria-label="关闭委派弹窗"
+                className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded flex-shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* 步骤指示：两态各自可辨，用户随时知道自己在第几步 */}
+            <div className="px-4 sm:px-6 pt-4 flex items-center gap-2 flex-shrink-0">
+              {[
+                { key: "confirm" as const, label: "① 建 zone 并写入 NS" },
+                { key: "records" as const, label: "② 确认并迁移解析" }
+              ].map((s) => (
+                <span
+                  key={s.key}
+                  data-deleg-step={s.key}
+                  data-deleg-active={delegateStep === s.key ? "1" : "0"}
+                  className={`flex-1 min-w-0 h-8 flex items-center justify-center rounded-lg text-xs font-semibold whitespace-nowrap ${
+                    delegateStep === s.key
+                      ? "bg-indigo-600 text-white"
+                      : s.key === "confirm"
+                        ? "bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-400 dark:border-emerald-900/60"
+                        : "bg-elevated text-content-muted border border-border-base"
+                  }`}
+                >
+                  {s.label}
+                </span>
+              ))}
+            </div>
+
+            {/* 模态框内容 */}
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
+              {delegateStep === "confirm" ? (
+                <>
+                  {/* 破坏性动作必须写清「会发生什么、损失是什么」（§9 / §23） */}
+                  <div className="p-3.5 rounded-xl border border-amber-300 bg-amber-50 dark:border-amber-900/60 dark:bg-amber-950/40 space-y-2">
+                    <p className="text-xs font-bold text-amber-800 dark:text-amber-300">
+                      这一步会改动 DNSHE 侧
+                    </p>
+                    <p className="text-xs text-amber-700 dark:text-amber-200/90 leading-relaxed">
+                      点击「开始委派」后会依次：① 在 Cloudflare 建一个 full setup zone；
+                      ② 把 Cloudflare 分配的两台 NS 写到 DNSHE 侧；③ 清掉 apex 上与 NS 冲突的
+                      非 NS 记录（不清理则 NS 写不进去）。记录迁移放在下一步、由你逐条确认。
+                    </p>
+                    <p className="text-xs font-bold text-rose-700 dark:text-rose-300 leading-relaxed">
+                      委派生效后原解析立即失效，直到下一步把记录写进 Cloudflare 为止 —— 这段真空期
+                      域名不可访问。
+                    </p>
+                  </div>
+
+                  {/* 根域准入结论：把「凭什么能」讲明白，而不是只给一个报错 */}
+                  <div className="p-3.5 rounded-xl border border-sky-200 bg-sky-50 dark:border-sky-900/60 dark:bg-sky-950/40">
+                    <p className="text-xs text-sky-800 dark:text-sky-300 leading-relaxed">
+                      根域名 <span className="font-mono font-semibold">{delegateDomain.rootdomain}</span> 在
+                      Public Suffix List 里，Cloudflare 会把它当可注册根域 —— 免费版即可为
+                      <span className="font-mono"> {delegateDomain.full_domain} </span>建立 zone 并把 NS 委派过去。
+                    </p>
+                  </div>
+
+                  {/* 目标账号：绑了多个才让选，只有一个就直接写明（少一次点击） */}
+                  {cfAccounts.length > 1 ? (
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-content-secondary">
+                        委派到哪个 Cloudflare 账号
+                      </label>
+                      <select
+                        value={delegateCfAccountId}
+                        onChange={(e) => setDelegateCfAccountId(e.target.value)}
+                        className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary"
+                      >
+                        <option value="">请选择账号…</option>
+                        {cfAccounts.map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.alias}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : cfAccounts.length === 1 ? (
+                    <div className="flex items-center justify-between gap-2 p-3.5 rounded-xl border border-border-base bg-hovered">
+                      <span className="text-xs text-content-muted font-medium">目标 Cloudflare 账号</span>
+                      <span className="text-xs font-semibold text-content-primary truncate min-w-0">
+                        {cfAccounts[0].alias}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="p-3.5 rounded-xl border border-rose-200 bg-rose-50 dark:border-rose-900/60 dark:bg-rose-950/40">
+                      <p className="text-xs text-rose-700 dark:text-rose-300 leading-relaxed">
+                        还没有绑定 Cloudflare 账号。请先到「账号管理」绑定一个 API Token
+                        （需 Zone:Read + Zone DNS:Edit 权限）。
+                      </p>
+                    </div>
+                  )}
+
+                  {delegateError && (
+                    <div className="p-3.5 rounded-xl border border-rose-200 bg-rose-50 dark:border-rose-900/60 dark:bg-rose-950/40">
+                      <p
+                        data-deleg-error
+                        className="text-xs text-rose-700 dark:text-rose-300 leading-relaxed break-words"
+                      >
+                        {delegateError}
+                      </p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                delegateResult && (
+                  <>
+                    {/* 委派结果一览 */}
+                    <div className="p-3.5 rounded-xl border border-border-base bg-hovered space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-content-secondary">
+                          {delegateResult.zone_reused ? "已复用已有 zone" : "已新建 zone"}
+                        </span>
+                        <span
+                          data-deleg-zone-status={delegateResult.zone_status}
+                          className={`text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap flex-shrink-0 border ${
+                            delegateResult.zone_status === "active"
+                              ? "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60"
+                              : "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-400 dark:border-amber-900/60"
+                          }`}
+                        >
+                          {delegateResult.zone_status === "active" ? "已激活" : "待激活"}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="text-content-muted font-medium flex-shrink-0">账号</span>
+                        <span className="font-mono text-content-secondary truncate min-w-0">
+                          {delegateResult.cf_account_alias}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="text-content-muted font-medium flex-shrink-0">zone</span>
+                        <span className="font-mono text-content-secondary truncate min-w-0">
+                          {delegateResult.zone_id}
+                        </span>
+                      </div>
+                      <div className="text-xs">
+                        <span className="text-content-muted font-medium block mb-1.5">
+                          已写入 DNSHE 的 NS
+                        </span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {delegateResult.ns_written.map((ns) => (
+                            <span
+                              key={ns}
+                              className="font-mono text-[11px] bg-surface border border-border-base rounded px-2 py-0.5"
+                            >
+                              {ns}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-content-muted leading-snug">
+                        Cloudflare 是异步去父区检测这两台 NS 的（分钟级），检测通过后 zone 状态会自动变成
+                        「已激活」。可到 Cloudflare 标签页同步一次查看最新状态。
+                      </p>
+                    </div>
+
+                    {/* NS 写失败：说清是哪条、为什么，并给出下一步动作（§8） */}
+                    {delegateResult.ns_failed.length > 0 && (
+                      <div className="p-3.5 rounded-xl border border-rose-200 bg-rose-50 dark:border-rose-900/60 dark:bg-rose-950/40 space-y-1.5">
+                        <p className="text-xs font-bold text-rose-700 dark:text-rose-300">
+                          {delegateResult.ns_failed.length} 条 NS 写入失败，委派尚未生效
+                        </p>
+                        {delegateResult.ns_failed.map((f) => (
+                          <p
+                            key={f.ns}
+                            className="text-[11px] font-mono text-rose-700 dark:text-rose-300 break-all"
+                          >
+                            {f.ns} —— {f.msg}
+                          </p>
+                        ))}
+                        {delegateResult.ns_management_disabled && (
+                          <p className="text-[11px] text-rose-700 dark:text-rose-300 leading-snug">
+                            DNSHE 上游已禁用该域名的 NS 管理，只能到 DNSHE 官网后台手动把 NS 改成上面两台。
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 被清掉的 apex 冲突记录：必须说出来，否则用户以为记录"凭空少了" */}
+                    {delegateResult.removed_records.length > 0 && (
+                      <div className="p-3.5 rounded-xl border border-amber-300 bg-amber-50 dark:border-amber-900/60 dark:bg-amber-950/40">
+                        <p className="text-xs font-bold text-amber-800 dark:text-amber-300 mb-1">
+                          已清理 {delegateResult.removed_records.length} 条 apex 冲突记录
+                        </p>
+                        {delegateResult.removed_records.map((r) => (
+                          <p
+                            key={r}
+                            className="text-[11px] font-mono text-amber-700 dark:text-amber-200/90 break-all"
+                          >
+                            {r}
+                          </p>
+                        ))}
+                        <p className="text-[11px] text-amber-700 dark:text-amber-200/90 mt-1 leading-snug">
+                          它们也在下面的迁移清单里，勾选后会在 Cloudflare 重新建回来。
+                        </p>
+                      </div>
+                    )}
+
+                    {/* 迁移清单 */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <h4 className="text-xs font-bold text-content-secondary uppercase tracking-wider min-w-0 truncate">
+                          待迁移记录（已选 {delegateSelectedKeys.size} / {delegateResult.records.length}）
+                        </h4>
+                        {delegateResult.records.length > 0 && (
+                          <button
+                            onClick={toggleAllDelegateRecords}
+                            className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 whitespace-nowrap flex-shrink-0 h-8 px-2 rounded-lg hover:bg-hovered"
+                          >
+                            {delegateSelectedKeys.size === delegateResult.records.length ? "全不选" : "全选"}
+                          </button>
+                        )}
+                      </div>
+
+                      {delegateResult.records.length === 0 ? (
+                        <div className="border border-dashed border-border-base rounded-xl p-6 text-center">
+                          <p className="text-xs text-content-muted">
+                            该域名原本没有可迁移的解析记录，无需重建。
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="bg-hovered border border-border-base rounded-xl overflow-hidden divide-y divide-border-soft max-h-64 overflow-y-auto">
+                          {delegateResult.records.map((rec, i) => {
+                            const key = String(i);
+                            return (
+                              <label
+                                key={key}
+                                data-deleg-rec={key}
+                                data-deleg-checked={delegateSelectedKeys.has(key) ? "1" : "0"}
+                                className="p-3 flex items-start gap-2.5 cursor-pointer"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={delegateSelectedKeys.has(key)}
+                                  onChange={() => toggleDelegateRecord(key)}
+                                  className="mt-0.5 w-4 h-4 rounded border-border-base text-indigo-600 focus:ring-indigo-500 flex-shrink-0 cursor-pointer"
+                                />
+                                <span className="min-w-0 flex-1">
+                                  <span className="flex items-center gap-2">
+                                    <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold whitespace-nowrap flex-shrink-0 bg-elevated text-content-secondary border border-border-base">
+                                      {rec.type}
+                                    </span>
+                                    <span className="font-mono text-xs text-content-primary truncate min-w-0">
+                                      {rec.name}
+                                    </span>
+                                  </span>
+                                  <span className="block font-mono text-[11px] text-content-muted truncate mt-0.5">
+                                    {rec.content}
+                                  </span>
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <p className="text-[11px] text-content-muted leading-snug">
+                        NS 与 SOA 不在清单里 —— 新建的 Cloudflare zone 自带这两类，重复写会直接冲突。
+                      </p>
+                    </div>
+
+                    {/* 逐条写入结果（§8：失败要逐条列出别名与原因） */}
+                    {delegateApplyResults && (
+                      <div
+                        data-deleg-apply="1"
+                        className="bg-hovered border border-border-base rounded-xl p-3 space-y-1 max-h-40 overflow-y-auto"
+                      >
+                        {delegateApplyResults.map((r, i) => (
+                          <div
+                            key={i}
+                            className={`flex items-start gap-2 text-[11px] ${
+                              r.success ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"
+                            }`}
+                          >
+                            {r.success ? (
+                              <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                            ) : (
+                              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                            )}
+                            <span className="font-mono break-all">
+                              {r.label} —— {r.message}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )
+              )}
+            </div>
+
+            {/* 模态框页脚：两按钮各占一半（§14 第 9 条：一行两个控件均分撑满） */}
+            <div
+              data-deleg-foot="1"
+              className="px-4 sm:px-6 py-4 border-t border-border-base bg-elevated flex-shrink-0"
+            >
+              {delegateStep === "confirm" ? (
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setDelegateDomain(null)}
+                    disabled={delegateLoading}
+                    className="h-10 flex items-center justify-center whitespace-nowrap bg-elevated hover:bg-hovered text-content-secondary border border-border-base rounded-lg text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={handleStartDelegate}
+                    disabled={
+                      delegateLoading ||
+                      cfAccounts.length === 0 ||
+                      (cfAccounts.length > 1 && !delegateCfAccountId)
+                    }
+                    className="h-10 flex items-center justify-center gap-1.5 whitespace-nowrap bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {delegateLoading && <RefreshCw className="w-4 h-4 animate-spin flex-shrink-0" />}
+                    {delegateLoading ? "委派中…" : "开始委派"}
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setDelegateDomain(null)}
+                    disabled={delegateLoading}
+                    className="h-10 flex items-center justify-center whitespace-nowrap bg-elevated hover:bg-hovered text-content-secondary border border-border-base rounded-lg text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    关闭
+                  </button>
+                  <button
+                    onClick={handleApplyDelegateRecords}
+                    disabled={delegateLoading || delegateSelectedKeys.size === 0}
+                    className="h-10 flex items-center justify-center gap-1.5 whitespace-nowrap bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-lg text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {delegateLoading && <RefreshCw className="w-4 h-4 animate-spin flex-shrink-0" />}
+                    {delegateLoading ? "写入中…" : "确认写入"}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
