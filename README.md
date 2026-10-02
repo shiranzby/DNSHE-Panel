@@ -9,6 +9,55 @@ DNSHE-Panel 基于 [lioil522/dnshe-manager](https://github.com/lioil522/dnshe-ma
 
 ---
 
+## 📸 界面预览
+
+**（1）概览看板** —— 12 张指标卡分三组（域名资产 / 账号与助力 / 配额）按列数 1–4 自适应排布，账号配额进度条与「最近注册」一眼看清：
+
+<img src="docs/screenshots/shydns-panel-1.png" width="880" alt="概览看板">
+
+**（2）域名列表** —— 按账号分组折叠，卡片内直接给出注册/到期时间、当前 DNS 服务商与认证状态，账号徽章标注「系统默认 / 外部 DNS」分布：
+
+<img src="docs/screenshots/shydns-panel-2.png" width="880" alt="域名列表">
+
+<details>
+<summary><b>展开其余 7 张页面截图（按左侧导航顺序编号）</b></summary>
+
+<br>
+
+**（3）Cloudflare** —— 已绑定账号下的 zone 卡片墙，逐卡显示注册/到期与解析来源：
+
+<img src="docs/screenshots/shydns-panel-3.png" width="820" alt="Cloudflare">
+
+**（4）域名能力** —— 助力额度、助力码与各账号助力进度总览：
+
+<img src="docs/screenshots/shydns-panel-4.png" width="820" alt="域名能力">
+
+**（5）账号管理** —— DNSHE 与 Cloudflare 账号统一绑定与校验：
+
+<img src="docs/screenshots/shydns-panel-5.png" width="820" alt="账号管理">
+
+**（6）API 密钥** —— 各账号 key/secret 集中管理，Secret 加密保存、按需解密，附调用次数与最近使用时间：
+
+<img src="docs/screenshots/shydns-panel-6.png" width="820" alt="API 密钥">
+
+**（7）注册 / 查重** —— 单域名即时查重与 WHOIS 注册：
+
+<img src="docs/screenshots/shydns-panel-7.png" width="820" alt="注册与查重">
+
+**（8）账户配额** —— 每账号基础额度、邀请加成、已用与可用配额：
+
+<img src="docs/screenshots/shydns-panel-8.png" width="820" alt="账户配额">
+
+**（9）运行日志** —— 按类型（同步/续期/系统）与等级筛选，分页浏览：
+
+<img src="docs/screenshots/shydns-panel-9.png" width="820" alt="运行日志">
+
+> 截图为演示数据，账号邮箱与域名均已打码。
+
+</details>
+
+---
+
 ## ✨ 功能特性
 
 ### 资产管理
