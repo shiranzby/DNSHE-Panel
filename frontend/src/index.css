@@ -273,28 +273,12 @@
   }
 }
 
-/**
- * 抽屉二级菜单的展开/收起
- *
- * NOTE: 用 `grid-template-rows: 0fr → 1fr` 过渡，而不是 `max-height`。
- *       max-height 必须猜一个具体上限，猜小了展开到一半被截断、猜大了收起时先卡住不动再突然跳；
- *       fr 的分母是内容实际高度，从 0fr 到 1fr 全程按比例插值，任何子项高度都平滑。
- *       子元素必须 `min-height: 0` + `overflow: hidden`，否则 0fr 时内容仍然把行撑开。
+/*
+ * NOTE: 第22轮删掉了 `.nav-sublist`（侧边栏「设置」的二级菜单同行移除，见 App.tsx 的 nav 注释）。
+ *       原本它用 `grid-template-rows: 0fr → 1fr` 做展开/收起过渡，而不是 max-height ——
+ *       max-height 必须猜一个具体上限，猜小了展开到一半被截断、猜大了收起时先卡住不动再突然跳。
+ *       若将来再引入「可折叠子菜单」，照这个写法来，别退回 max-height。
  */
-.nav-sublist {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 280ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.nav-sublist > * {
-  min-height: 0;
-  overflow: hidden;
-}
-
-.nav-sublist[data-open="true"] {
-  grid-template-rows: 1fr;
-}
 
 /* 尊重系统的「减少动态效果」偏好 */
 @media (prefers-reduced-motion: reduce) {
@@ -303,10 +287,6 @@
   .page-anim,
   .expand-anim {
     animation: none;
-  }
-  /* 抽屉二级菜单的展开过渡同样要能被关掉 */
-  .nav-sublist {
-    transition: none;
   }
   /* 手机端顶部下拉抽屉的滑出过渡 */
   #app-nav-panel {

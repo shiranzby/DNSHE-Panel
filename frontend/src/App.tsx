@@ -549,42 +549,39 @@ const SEARCH_CONFIG: Record<string, { placeholder: string; enabled: boolean }> =
 };
 
 /**
- * 设置页各小节（同时服务两件事：顶栏搜索按关键词过滤、抽屉里的二级菜单跳转）
+ * 设置页各小节（供顶栏搜索按关键词过滤）
  *
- * - `id`：卡片 DOM 的 id，抽屉二级菜单点进来时 `scrollIntoView` 用。
- * - `label`：抽屉二级菜单显示的名字。
+ * - `id`：卡片 DOM 的 id，同时是搜索命中的键（见 settingsSectionVisible）。
  * - `keywords`：搜索用的关键词串（含**子标题**，如「修改登录密码」「两步验证」）——
  *   用户明确要求「他们的各子级标题如修改登录密码等都可以搜索」。
  *   匹配方式是「关键词串包含用户输入」（见 settingsSectionVisible），
  *   所以这里要把同义说法、中英文都写进去，漏一个就是搜不到。
+ *
+ * NOTE: 第22轮起侧边栏不再有「设置」的二级菜单（用户：「去除掉侧边栏设置的二级标题」），
+ *       原先的 `label`（二级菜单显示名）随之删掉；小节的显示名以设置页卡片标题为准。
  */
-const SETTINGS_SECTIONS: Array<{ id: string; label: string; keywords: string }> = [
+const SETTINGS_SECTIONS: Array<{ id: string; keywords: string }> = [
   {
     id: "settings-backend",
-    label: "后端地址",
     keywords:
       "后端地址 后端 worker 地址 workers.dev 自定义后端 服务器地址 已配置 未配置 自动推演 恢复自动",
   },
   {
     id: "settings-security",
-    label: "账户安全",
     keywords:
       "账户安全 当前管理员 管理员用户名 修改登录密码 修改密码 原密码 新密码 确认新密码 同时修改用户名 保存新密码 两步验证 2fa totp 动态码 二维码 密钥 secret 开启两步验证 关闭 2fa 已开启 未开启",
   },
   {
     id: "settings-renew",
-    label: "自动续期",
     keywords: "自动续期 启用自动续期 续期阈值 阈值 天数 即将到期 renew",
   },
   {
     id: "settings-line-ns",
-    label: "解析线路支持名单",
     keywords:
       "解析线路支持名单 线路解析 线路 ns 后缀 ns 记录 根域名 判定结果 电信 联通 移动 海外 教育网 添加 恢复默认 清空实测标记 重新查询 ns",
   },
   {
     id: "settings-notify",
-    label: "通知渠道",
     keywords:
       "通知渠道 渠道选择 保存全部设置 邮箱 smtp 端口 发件邮箱 收件邮箱 发件人显示名 授权码 telegram 钉钉 飞书 企业微信 server酱 方糖 通用 webhook bot token chat id sendkey",
   },
@@ -691,14 +688,6 @@ export default function App() {
 
   // 手机端侧栏抽屉开关（仅 <md 生效；≥md 侧栏常驻，这个状态用不上）
   const [sidebarOpen, setSidebarOpen] = useState(false);
-
-  /**
-   * 抽屉里「展开中的二级菜单」是哪一个（值为顶层页签 key，null = 全部收起）
-   *
-   * 目前只有「设置」有下级小节：其余页签都是一个整页、没有可拆的子项。
-   * 默认全部收起（§6：数量不确定的列表默认收起），否则抽屉一打开就多出 5 行。
-   */
-  const [navExpanded, setNavExpanded] = useState<string | null>(null);
 
   /**
    * 是否处于 md 及以上宽度 —— 手机抽屉与桌面常驻侧栏的分界
@@ -2139,33 +2128,6 @@ export default function App() {
   const settingsRightColVisible = ["settings-line-ns", "settings-notify"].some((id) =>
     settingsSectionVisible(id)
   );
-
-  /**
-   * 跳到设置页某个小节（抽屉二级菜单用）
-   *
-   * NOTE: 不能直接 `scrollIntoView` —— 切页与设置数据加载都是异步的：
-   * 目标卡片在「设置页数据还没到位」时根本不在 DOM 里（页面此时是 loading 态）。
-   * 所以按 120ms 轮询等它出现（最多 ~1.5s），出现后平滑滚过去并描一圈高亮，
-   * 让用户看得见"跳到了哪一张卡"。
-   */
-  const scrollToSettingsSection = (sectionId: string) => {
-    let tries = 0;
-    const tick = () => {
-      const el = document.getElementById(sectionId);
-      if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
-        el.style.outline = "2px solid rgb(99 102 241 / 0.65)";
-        el.style.outlineOffset = "4px";
-        window.setTimeout(() => {
-          el.style.outline = "";
-          el.style.outlineOffset = "";
-        }, 1600);
-        return;
-      }
-      if (tries++ < 12) window.setTimeout(tick, 120);
-    };
-    window.setTimeout(tick, 60);
-  };
 
   /** 分批域名同步的进度（null = 未在同步） */
   const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null);
@@ -6403,15 +6365,17 @@ export default function App() {
         </div>
 
         {/* 菜单项 */}
+        {/*
+          第22轮：删掉「设置」的二级菜单（用户：「去除掉侧边栏设置的二级标题」）。
+          原先它是全站唯一有下级小节的页签，展开/收起走 .nav-sublist 的
+          grid-template-rows 0fr↔1fr 过渡。移除后：
+            · 「设置」行回到与其他页签完全同形（只剩一个主按钮，右侧不再占箭头位）；
+            · 子项跳转用的 scrollToSettingsSection 与 navExpanded 状态同时删掉；
+            · 设置页内部的小节照旧 —— 顶栏搜索仍按 SETTINGS_SECTIONS.keywords 过滤卡片。
+          保留下面的 flex 包裹层（不再有第二个子节点），是为了不改动导航行的既有几何。
+        */}
         <nav className="flex-1 py-4 px-2 space-y-1 overflow-y-auto overscroll-contain">
           {navItems.map((item) => {
-            /*
-              二级菜单：目前只有「设置」有下级小节（后端地址 / 账户安全 / 自动续期 /
-              解析线路支持名单 / 通知渠道），其余页签是一个整页、没有可拆的子项。
-              railMode（桌面折叠成图标条）下不渲染二级菜单 —— 那个宽度放不下文字。
-            */
-            const children = item.key === "settings" ? SETTINGS_SECTIONS : null;
-            const expanded = navExpanded === item.key;
             return (
               <div key={item.key}>
                 <div className="flex items-center gap-0.5">
@@ -6440,51 +6404,7 @@ export default function App() {
                       </>
                     )}
                   </button>
-                  {/* 展开/收起二级菜单的箭头。与左侧主按钮同一行，只占图标宽 */}
-                  {children && !railMode && (
-                    <button
-                      onClick={() => setNavExpanded(expanded ? null : item.key)}
-                      className="p-2 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-all flex-shrink-0"
-                      title={expanded ? `收起「${item.label}」子菜单` : `展开「${item.label}」子菜单`}
-                      aria-label={expanded ? "收起子菜单" : "展开子菜单"}
-                      aria-expanded={expanded}
-                    >
-                      <ChevronDown
-                        className={`w-4 h-4 transition-transform duration-300 ${expanded ? "rotate-180" : ""}`}
-                      />
-                    </button>
-                  )}
                 </div>
-                {/*
-                  二级菜单容器用 .nav-sublist（grid-template-rows 0fr↔1fr 过渡，见 index.css）：
-                  收起态是**高度 0 + overflow hidden**，不是「不渲染」，这样才能做出展开/收起动画。
-                  代价是收起时子项仍在 DOM 里 ⇒ 用 tabIndex={-1} 把它们移出键盘 Tab 序列，
-                  否则键盘用户会 focus 到看不见的按钮上。
-                */}
-                {children && !railMode && (
-                  <div className="nav-sublist" data-open={expanded ? "true" : "false"}>
-                    <div>
-                      <div className="pt-1 pb-0.5 space-y-0.5">
-                        {children.map((c) => (
-                          <button
-                            key={c.id}
-                            tabIndex={expanded ? 0 : -1}
-                            onClick={() => {
-                              // 先切到设置页再滚过去；滚动要等设置数据渲染出来，见 scrollToSettingsSection
-                              setActiveTab("settings");
-                              setSidebarOpen(false);
-                              scrollToSettingsSection(c.id);
-                            }}
-                            className="w-full flex items-center gap-2 pl-9 pr-3 py-2 rounded-lg text-xs font-semibold text-content-muted hover:text-content-primary hover:bg-hovered transition-all"
-                          >
-                            <span className="w-1 h-1 rounded-full bg-current flex-shrink-0" />
-                            <span className="min-w-0 truncate text-left">{c.label}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
               </div>
             );
           })}
