@@ -30,4 +30,5 @@ data
 # 文档与脚本（运行时用不到）
 README.md
 clean-local.cmd
-scripts
+scripts/*
+!scripts/test-account-binding-errors.mjs

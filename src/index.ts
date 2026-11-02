@@ -3,7 +3,7 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
 import type { DBDomain } from "./db";
-import { DNSHEClient } from "./dnshe";
+import { DNSHEClient, DNSHEApiError } from "./dnshe";
 import type { ApiKeyInfo, CreateDnsRecordParams, DnsRecordInfo, UpdateDnsRecordParams } from "./dnshe";
 import { CloudflareClient, CF_READ_BUDGET_EXHAUSTED, mapZoneToUpstream, zoneIdToNumericId } from "./cloudflare";
 import type { CfZoneInfo } from "./cloudflare";
@@ -33,6 +33,15 @@ function errorRes(message: string, errorCode?: string) {
     res.error_code = errorCode;
   }
   return res;
+}
+
+/** 绑定/换密钥的上游故障与面板会话鉴权分开；不把上游 401 透传成面板退出。 */
+function accountBindingFailure(error: unknown): { message: string; code?: string; status: 400 | 502 | 504 } {
+  const message = error instanceof Error ? error.message : "未知错误";
+  if (!(error instanceof DNSHEApiError)) return { message, status: 400 };
+  const status = error.code === "dnshe_timeout" ? 504
+    : error.status === 0 || error.status >= 500 || error.code === "dnshe_invalid_response" ? 502 : 400;
+  return { message, code: error.code, status };
 }
 
 type Bindings = {
@@ -938,8 +947,8 @@ app.post("/api/accounts", async (c) => {
 
     return c.json(successRes({ account: newAccount }));
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    return c.json(errorRes(message), 400);
+    const failure = accountBindingFailure(e);
+    return c.json(errorRes(failure.message, failure.code), failure.status);
   }
 });
 
@@ -1059,8 +1068,8 @@ app.put("/api/accounts/:id", async (c) => {
 
     return c.json(successRes({ account: updatedAccount, message: "账号信息已更新" }));
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    return c.json(errorRes(message), 400);
+    const failure = accountBindingFailure(e);
+    return c.json(errorRes(failure.message, failure.code), failure.status);
   }
 });
 

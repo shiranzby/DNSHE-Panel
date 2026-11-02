@@ -30,8 +30,10 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src/ ./src/
 COPY server/ ./server/
+COPY scripts/test-account-binding-errors.mjs ./scripts/
+COPY schema.sql ./schema.sql
 # 先过一遍 tsc 再打包：类型出问题就让镜像构建直接失败，而不是等运行时才炸
-RUN npm run verify:node && npm run test:node && npm run build:node
+RUN npm run verify:node && npm run test:node && npm run test:accounts:binding && npm run build:node
 
 
 # ---------- 阶段 3：运行时 ----------

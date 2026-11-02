@@ -67,7 +67,7 @@ jobs:
       - name: 准备 Buildx
         uses: docker/setup-buildx-action@v4
 
-      # 这一步会跑 Dockerfile 阶段 2 里的 tsc 与 17 项 D1→SQLite 适配层自检，
+      # Dockerfile 阶段 2 运行 tsc、22 项 D1→SQLite 自检和 15 项账号绑定回归，
       # 任何一项不过都会让构建直接失败（这是刻意设计的闸门）。
       - name: 构建镜像（含类型检查与适配层自检）
         uses: docker/build-push-action@v7

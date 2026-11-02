@@ -1,9 +1,16 @@
-import { DNSHEClient } from "./dnshe";
+import { DNSHEClient, DNSHEApiError } from "./dnshe";
 import { CloudflareClient } from "./cloudflare";
 import { DNS_THREE_STATES } from "./dns-provider";
 
 /** 绑定账号的提供商 */
 export type AccountProvider = "dnshe" | "cloudflare";
+
+function credentialVerificationError(prefix: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : "未知错误";
+  return error instanceof DNSHEApiError
+    ? new DNSHEApiError(`${prefix}: ${message}`, error.status, error.code)
+    : new Error(`${prefix}: ${message}`);
+}
 
 /**
  * 把任意时刻格式化成与日志/缓存时间一致的北京时间字符串
@@ -1023,8 +1030,7 @@ export class DatabaseManager {
         if (keyName) return keyName;
       }
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "未知错误";
-      throw new Error(`无法验证 API 密钥有效性: ${message}`);
+      throw credentialVerificationError("无法验证 API 密钥", e);
     }
     return null;
   }
@@ -1088,10 +1094,9 @@ export class DatabaseManager {
       } else {
         // 显式提供别名时，仍需校验密钥是否可用
         try {
-          await client.getQuota();
+          await client.getQuota(8000);
         } catch (e: unknown) {
-          const message = e instanceof Error ? e.message : "未知错误";
-          throw new Error(`无法验证 API 密钥有效性: ${message}`);
+          throw credentialVerificationError("无法验证 API 密钥", e);
         }
       }
     }
@@ -1187,10 +1192,9 @@ export class DatabaseManager {
         }
         const client = new DNSHEClient(newKey, newSecret);
         try {
-          await client.getQuota();
+          await client.getQuota(8000);
         } catch (e: unknown) {
-          const message = e instanceof Error ? e.message : "未知错误";
-          throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+          throw credentialVerificationError("无法验证新 API 密钥", e);
         }
         finalApiKey = newKey;
         finalEncryptedSecret = await encryptText(newSecret, this.aesKey);

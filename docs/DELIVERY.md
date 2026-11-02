@@ -2,6 +2,12 @@
 
 ## 当前状态
 
+2026-11-03：审查 issue #3 截图，确认错误来自 DNSHE 上游 HTTP 520；报告者的实际网络根因仍需接口、时间与 Ray ID，不能声称已修复对方的回源/出口问题。新增上游错误分类与绑定校验反例，修复填写别名时 HTTP 200 异常响应可能误通过校验的问题。两条绑定路径及更换凭据均有校验超时，失败不写账号、换凭据失败保旧。用户随后授权完善并推送源码、拟定回复；不部署生产、不直接评论或关闭 issue。排查与回复草稿见 [issue #3](issues/3-account-binding-520.md)。
+
+本轮绑定定向回归为 15/15，新增“收到 520 后取消挂起错误页正文”反例；Docker 双架构构建加入相同闸门。阶段回归：委派 16/16、预览隔离 9/9、鉴权日志 6/6、续期规则 8/8、SQLite 22/22、local KV 4/4、用量后端 22/22（含本地 workerd）通过；Worker/Node 类型检查与 Node 构建通过。外部 API 均为合成夹具，未使用真人凭据或远端业务写入。未改前端，也未将旧截图或生产版本当作本轮实网复现证据。
+
+## 已发布基线
+
 2026-10-22：修复注册后缓存延迟与自动续期边界，并新增独立“自动续期”工作页。注册后对上游列表做有界重试，仍未出现时通过 Worker waitUntil 继续后台重试，前端轮询本地缓存并明确显示待同步；续期成功但缺少 `new_expires_at` 不再覆盖本地旧值，已过期域名进入候选，缺少到期时间仍保持未知。本轮源码、README 与 Release 说明已整理，生产实例不重复部署。
 
 新增定向回归：`npm run test:renewal:rules`（8/8），覆盖缺失日期、进入阈值、越过阈值、已过期及续期响应缺失字段。委派 16/16、SQLite 22/22、local KV 4/4、登录审计 6/6、预览隔离 9/9、注册/DDNS 16/16 均通过；前后端构建均通过。Pages 13/13 路由及续期三模式×两宽度通过，无外部请求和页面/控制台错误，六张深色截图已目视。真实域名注册／续期写入未执行。
@@ -67,6 +73,7 @@ npm run verify:node
 git diff --check
 npm run test:delegate:cf
 npm run test:renewal:rules
+npm run test:accounts:binding
 npm run test:local-kv
 npm run build:node
 npm run verify:node

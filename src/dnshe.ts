@@ -191,9 +191,15 @@ export interface UpdateDnsRecordParams extends CreateDnsRecordParams {
   record_id: string | number;
 }
 
-/**
- * DNSHE API 请求封装类
- */
+/** 保留上游状态与错误码，不能把网络失败翻译成“密钥无效”。 */
+export class DNSHEApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code: string) {
+    super(message);
+    this.name = "DNSHEApiError";
+  }
+}
+
+/** DNSHE API 请求封装类。 */
 export class DNSHEClient {
   private apiKey: string;
   private apiSecret: string;
@@ -262,7 +268,21 @@ export class DNSHEClient {
 
     try {
       const response = await fetch(url, options);
-      const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      if (response.status >= 500) {
+        // 不等待可能挂起的错误页正文；5xx 不是凭据被拒绝，只保留安全的诊断信息。
+        void response.body?.cancel().catch(() => {});
+        const ray = response.headers.get("cf-ray") || "";
+        const trace = /^[a-zA-Z0-9-]{1,64}$/.test(ray) ? `；Ray ID: ${ray}` : "";
+        return {
+          ok: false, status: response.status, data: null, code: "dnshe_upstream_error",
+          message: `DNSHE 上游服务返回 HTTP ${response.status}（${endpoint}${action ? "/" + action : ""}${trace}），不能据此判断密钥无效。请稍后重试；若本地可用而 Workers 持续失败，请联系 DNSHE 排查请求出口或使用可访问上游的 Docker 主机。`,
+        };
+      }
+      const parsed = await response.json().catch((error: unknown) => {
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        return null;
+      });
+      const body: Record<string, unknown> = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
       const message =
         (typeof body.message === "string" && body.message) ||
         (typeof body.msg === "string" && body.msg) ||
@@ -280,11 +300,19 @@ export class DNSHEClient {
         (typeof body.error_code === "string" && body.error_code) ||
         (typeof body.code === "string" && body.code) ||
         "";
-      return { ok: response.ok, status: response.status, data: (body as unknown as T) ?? null, message, code };
+      if (response.ok && typeof body.success !== "boolean") {
+        return { ok: false, status: response.status, data: null, code: "dnshe_invalid_response", message: `DNSHE ${endpoint}${action ? "/" + action : ""} 未返回有效 API JSON，不能验证密钥；请检查上游网关响应。` };
+      }
+      return { ok: response.ok, status: response.status, data: body as unknown as T, message, code };
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
       console.error(`DNSHE API Error [${endpoint}/${action}]:`, message);
-      return { ok: false, status: 0, data: null, message, code: "" };
+      const timedOut = error instanceof Error && error.name === "AbortError";
+      return {
+        ok: false, status: 0, data: null,
+        message: timedOut ? "DNSHE 上游请求超时，请稍后重试；不能据此判断密钥无效。" : "无法连接 DNSHE 上游服务，请检查服务端出口网络；本地 curl 成功不代表 Workers 出口可用。",
+        code: timedOut ? "dnshe_timeout" : "dnshe_network_error",
+      };
     } finally {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     }
@@ -300,11 +328,9 @@ export class DNSHEClient {
     timeoutMs = 0
   ): Promise<T> {
     const r = await this.requestRaw<T>(endpoint, action, method, params, headersOverride, timeoutMs);
-    if (!r.ok) {
+    if (!r.ok || r.data?.success === false) {
       // 把上游错误码挂在异常上，路由层的 translateUpstreamError 才能按码翻译
-      const err = new Error(r.message || `HTTP error! status: ${r.status}`) as Error & { code?: string };
-      err.code = r.code;
-      throw err;
+      throw new DNSHEApiError(r.message || `HTTP error! status: ${r.status}`, r.status, r.code || "dnshe_api_error");
     }
     return r.data as T;
   }
@@ -337,8 +363,8 @@ export class DNSHEClient {
   /**
    * 获取账号额度配额
    */
-  async getQuota(): Promise<QuotaResponse> {
-    return this.request<QuotaResponse>("quota", "", "GET");
+  async getQuota(timeoutMs = 0): Promise<QuotaResponse> {
+    return this.request<QuotaResponse>("quota", "", "GET", {}, undefined, timeoutMs);
   }
 
   /**

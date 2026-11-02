@@ -391,6 +391,7 @@ npm run test:usage:backend
 npm run test:cf:permissions
 npm run test:delegate:cf
 npm run test:renewal:rules
+npm run test:accounts:binding
 npm run test:domain-check:cache
 npm run test:node
 npm run verify:node
@@ -523,6 +524,17 @@ docker compose logs --tail=100 dnshe-panel
 | DDNS 更新 | `ddns/update` | — | 使用记录专用 Bearer Token，不把令牌放进 URL 或日志 |
 
 DNSHE 主 API 使用 `X-API-Key` 与 `X-API-Secret`；DDNS 使用记录级 Bearer Token。若 V1/V2 返回字段不完整，面板会保留旧快照并在运行日志中标明失败，不把失败转换为空数据或成功。
+
+### 添加 DNSHE 账号提示 HTTP 520，但本地 curl 正常？
+
+这表示面板校验凭据时，上游返回了 520；**不能据此判断 Key/Secret 错误，也不能仅凭本地 curl 正常认定 Workers 出口正常**。源站异常、Cloudflare 回源或不同出口的访问限制都需要进一步排查。
+
+- 不填写别名时校验 `keys/list`，填写别名时校验 `quota`。请比较相同端点；若只有 `keys/list` 异常而 `quota` 正常，可先填写别名绑定，仍会执行凭据校验。
+- 记录报错时间、HTTP 状态、接口与 Ray ID，向 DNSHE 提供脱敏信息核查；不要公开 Key、Secret、面板会话或未经脱敏的 HAR。
+- 若 Workers 持续失败，可在一台已验证能访问这些接口的主机上使用 [Docker 自建](#方式三docker-自建)。换部署方式不保证上游恢复，应先验证主机出口，保留数据与原 `AES_KEY`。
+- 520 不是让你关闭面板鉴权、反复生成密钥或修改自定义域名 SSL 模式的依据。
+
+完整分析、排查顺序与给部署 AI 的提示见 [issue #3 排查说明](docs/issues/3-account-binding-520.md)。
 
 ### Docker 自建版有生产环境鉴权吗？
 
