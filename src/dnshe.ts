@@ -192,8 +192,16 @@ export interface UpdateDnsRecordParams extends CreateDnsRecordParams {
 }
 
 /** 保留上游状态与错误码，不能把网络失败翻译成“密钥无效”。 */
+export interface DNSHEApiDiagnostic {
+  status: number;
+  endpoint: string;
+  action: string;
+  response_type: "json" | "non-json" | "not-read";
+  ray_id?: string;
+}
+
 export class DNSHEApiError extends Error {
-  constructor(message: string, readonly status: number, readonly code: string) {
+  constructor(message: string, readonly status: number, readonly code: string, readonly diagnostic?: DNSHEApiDiagnostic) {
     super(message);
     this.name = "DNSHEApiError";
   }
@@ -212,6 +220,14 @@ export class DNSHEClient {
     this.baseUrl = "https://api005.dnshe.com/index.php";
   }
 
+  private safeMessage(message: string): string {
+    let result = message;
+    for (const secret of [this.apiKey, this.apiSecret]) {
+      if (secret) result = result.split(secret).join("[redacted]");
+    }
+    return result.slice(0, 1200);
+  }
+
   /**
    * 通用请求封装 — 支持泛型返回值类型
    */
@@ -228,7 +244,7 @@ export class DNSHEClient {
     params: Record<string, unknown> = {},
     headersOverride?: Record<string, string>,
     timeoutMs = 0
-  ): Promise<{ ok: boolean; status: number; data: T | null; message: string; code: string }> {
+  ): Promise<{ ok: boolean; status: number; data: T | null; message: string; code: string; diagnostic?: DNSHEApiDiagnostic }> {
     let url = `${this.baseUrl}?m=domain_hub&endpoint=${endpoint}&action=${action}`;
 
     const headers: Record<string, string> = headersOverride ?? {
@@ -268,13 +284,15 @@ export class DNSHEClient {
 
     try {
       const response = await fetch(url, options);
+      const ray = response.headers.get("cf-ray") || "";
+      const rayId = /^[0-9a-fA-F]{16,32}(?:-[A-Z]{3})?$/.test(ray) ? ray : undefined;
+      const diagnostic: DNSHEApiDiagnostic = { status: response.status, endpoint, action, response_type: "not-read", ...(rayId ? { ray_id: rayId } : {}) };
       if (response.status >= 500) {
         // 不等待可能挂起的错误页正文；5xx 不是凭据被拒绝，只保留安全的诊断信息。
         void response.body?.cancel().catch(() => {});
-        const ray = response.headers.get("cf-ray") || "";
-        const trace = /^[a-zA-Z0-9-]{1,64}$/.test(ray) ? `；Ray ID: ${ray}` : "";
+        const trace = rayId ? `；Ray ID: ${rayId}` : "";
         return {
-          ok: false, status: response.status, data: null, code: "dnshe_upstream_error",
+          ok: false, status: response.status, data: null, code: "dnshe_upstream_error", diagnostic,
           message: `DNSHE 上游服务返回 HTTP ${response.status}（${endpoint}${action ? "/" + action : ""}${trace}），不能据此判断密钥无效。请稍后重试；若本地可用而 Workers 持续失败，请联系 DNSHE 排查请求出口或使用可访问上游的 Docker 主机。`,
         };
       }
@@ -283,12 +301,13 @@ export class DNSHEClient {
         return null;
       });
       const body: Record<string, unknown> = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-      const message =
+      diagnostic.response_type = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? "json" : "non-json";
+      const message = this.safeMessage(
         (typeof body.message === "string" && body.message) ||
         (typeof body.msg === "string" && body.msg) ||
         (typeof body.error === "string" && body.error) ||
         (typeof body.detail === "string" && body.detail) ||
-        (response.ok ? "" : `HTTP error! status: ${response.status}`);
+        (response.ok ? "" : `HTTP error! status: ${response.status}`));
       /*
        * 🔴 `error_code` 必须单独带出来（第24轮E 修正）。
        *    官方错误的真实形态是 `{"message":"IP not allowed","error_code":"auth_ip_not_allowed"}`
@@ -301,12 +320,17 @@ export class DNSHEClient {
         (typeof body.code === "string" && body.code) ||
         "";
       if (response.ok && typeof body.success !== "boolean") {
-        return { ok: false, status: response.status, data: null, code: "dnshe_invalid_response", message: `DNSHE ${endpoint}${action ? "/" + action : ""} 未返回有效 API JSON，不能验证密钥；请检查上游网关响应。` };
+        return { ok: false, status: response.status, data: null, code: "dnshe_invalid_response", diagnostic, message: `DNSHE ${endpoint}${action ? "/" + action : ""} 未返回有效 API JSON，不能验证密钥；请检查上游网关响应。` };
       }
-      return { ok: response.ok, status: response.status, data: body as unknown as T, message, code };
+      if (response.status === 403 && diagnostic.response_type === "non-json") {
+        return { ok: false, status: 403, data: null, code: "dnshe_upstream_forbidden", diagnostic,
+          message: `DNSHE ${endpoint}${action ? "/" + action : ""} 返回 HTTP 403，未返回 API 错误 JSON${rayId ? `（Ray ID: ${rayId}）` : ""}；拒绝原因尚未确认，请核查上游访问策略。` };
+      }
+      const safeCode = /^[a-zA-Z0-9_-]{1,80}$/.test(code) && code !== this.apiKey && code !== this.apiSecret ? code : "";
+      return { ok: response.ok, status: response.status, data: body as unknown as T, message, code: safeCode, diagnostic };
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";
-      console.error(`DNSHE API Error [${endpoint}/${action}]:`, message);
+      console.error(`DNSHE API Error [${endpoint}/${action}]:`, this.safeMessage(message));
       const timedOut = error instanceof Error && error.name === "AbortError";
       return {
         ok: false, status: 0, data: null,
@@ -330,7 +354,7 @@ export class DNSHEClient {
     const r = await this.requestRaw<T>(endpoint, action, method, params, headersOverride, timeoutMs);
     if (!r.ok || r.data?.success === false) {
       // 把上游错误码挂在异常上，路由层的 translateUpstreamError 才能按码翻译
-      throw new DNSHEApiError(r.message || `HTTP error! status: ${r.status}`, r.status, r.code || "dnshe_api_error");
+      throw new DNSHEApiError(r.message || `HTTP error! status: ${r.status}`, r.status, r.code || "dnshe_api_error", r.diagnostic);
     }
     return r.data as T;
   }
@@ -351,13 +375,13 @@ export class DNSHEClient {
     method: "GET" | "POST" = "POST"
   ): Promise<T> {
     const first = await this.requestRaw<T>(v2.endpoint, v2.action, method, v2.params);
-    if (first.ok) return first.data as T;
+    if (first.ok && first.data?.success === true) return first.data as T;
     const notExist =
-      first.status === 404 || /not[_ ]?found|unknown|not support|不存在|不支持/i.test(first.message || "");
-    if (!notExist) throw new Error(first.message || `HTTP error! status: ${first.status}`);
+      first.status === 404 || ([400, 405, 422].includes(first.status) && /not[_ ]?found|unknown|not support|不存在|不支持/i.test(first.message || ""));
+    if (!notExist) throw new DNSHEApiError(first.message || `HTTP error! status: ${first.status}`, first.status, first.code || "dnshe_api_error", first.diagnostic);
     const second = await this.requestRaw<T>(legacy.endpoint, legacy.action, method, legacy.params);
-    if (second.ok) return second.data as T;
-    throw new Error(second.message || first.message || `HTTP error! status: ${second.status}`);
+    if (second.ok && second.data?.success === true) return second.data as T;
+    throw new DNSHEApiError(second.message || first.message || `HTTP error! status: ${second.status}`, second.status, second.code || "dnshe_api_error", second.diagnostic);
   }
 
   /**

@@ -3038,9 +3038,13 @@ app.get("/api/expiry", async (c) => {
  */
 app.post("/api/domains/register", async (c) => {
   const dbManager = c.get("db");
+  let target = "";
+  let targetAccount = "";
 
   try {
     const { account_id, subdomain, rootdomain } = await c.req.json();
+    target = capText(`${subdomain || ""}.${rootdomain || ""}`, 253);
+    targetAccount = capText(account_id, 20);
     if (!account_id || !subdomain || !rootdomain) {
       return c.json(errorRes("必须提供 account_id, subdomain 及 rootdomain", "bad_request"), 400);
     }
@@ -3095,6 +3099,13 @@ app.post("/api/domains/register", async (c) => {
       throw new Error(res.message || "注册子域名失败");
     }
   } catch (e: unknown) {
+    if (e instanceof DNSHEApiError) {
+      const translated = translateUpstreamError(e.message, e.code);
+      const code = translated.errorCode === "internal_error" ? e.code : translated.errorCode;
+      await dbManager.writeLog("warning", "api", `域名注册失败 [${target}]（账号 ${targetAccount}）：${translated.message}`, { error_code: code, ...(e.diagnostic ? { upstream: e.diagnostic } : {}) });
+      const failure = accountBindingFailure(e);
+      return c.json({ ...errorRes(translated.message, code), ...(e.diagnostic ? { upstream: e.diagnostic } : {}) }, failure.status);
+    }
     const message = e instanceof Error ? e.message : "注册子域名发生错误";
     return c.json(errorRes(message), 400);
   }

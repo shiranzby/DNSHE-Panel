@@ -8,7 +8,7 @@ export type AccountProvider = "dnshe" | "cloudflare";
 function credentialVerificationError(prefix: string, error: unknown): Error {
   const message = error instanceof Error ? error.message : "未知错误";
   return error instanceof DNSHEApiError
-    ? new DNSHEApiError(`${prefix}: ${message}`, error.status, error.code)
+    ? new DNSHEApiError(`${prefix}: ${message}`, error.status, error.code, error.diagnostic)
     : new Error(`${prefix}: ${message}`);
 }
 
