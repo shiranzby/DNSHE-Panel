@@ -597,11 +597,11 @@ export class DatabaseManager {
 
   // ===== 配额缓存的按账号维护 =====
   //
-  // NOTE: 配额缓存走的是「写操作回源回填、读操作只命中缓存」模型，TTL 长达 366 天。
+  // 配额缓存保留快照供失败排查；读取接口只复用 60 秒内已核实的完整结果。
   // 但账号的增删改会改变账号集合，这份缓存却一直没跟着变，于是「账户配额」页
   // 依然列着已解绑的账号、也看不到新绑定的账号，只能点「刷新」强制回源才对得上。
   // 下面三个方法按账号粒度打补丁：解绑与改名零上游调用，只有新绑定/换 Key 才拉一次配额。
-  // 缓存本就不存在时一律直接跳过 —— 下一次读取会整体回源重建。
+  // 单账号实时查询可以回填空缓存；聚合读取仍会检查账号集合是否完整。
 
   /** 读取配额缓存数组；缓存不存在或内容损坏时返回 null */
   private async readQuotaCache(): Promise<QuotaEntry[] | null> {
@@ -619,6 +619,15 @@ export class DatabaseManager {
   private async writeQuotaCache(entries: QuotaEntry[]): Promise<void> {
     const sorted = [...entries].sort((a, b) => Number(a.account_id) - Number(b.account_id));
     await this.setCache(QUOTA_CACHE_KEY, JSON.stringify(sorted));
+  }
+
+  /** 单账号实时结果回填；旧缓存缺失时也保留本次已核实的配额。 */
+  async saveAccountQuota(accountId: number, alias: string, quota: Record<string, unknown>): Promise<void> {
+    const cached = await this.readQuotaCache() || [];
+    await this.writeQuotaCache([
+      ...cached.filter((q) => Number(q.account_id) !== Number(accountId)),
+      { ...quota, account_id: Number(accountId), alias, fetched_at: Date.now() },
+    ]);
   }
 
   /** 解绑账号：摘掉对应条目 */
@@ -639,11 +648,10 @@ export class DatabaseManager {
   }
 
   /** 新绑定 / 换 Key：拉一次该账号的配额写回缓存，只影响这一个账号（Cloudflare 账号无配额概念，直接清掉缓存条目） */
-  async refreshAccountQuotaCache(accountId: number, alias: string, provider: AccountProvider = "dnshe"): Promise<void> {
-    const cached = await this.readQuotaCache();
-    if (cached === null) return;
-
+  async refreshAccountQuotaCache(accountId: number, alias: string, provider: AccountProvider = "dnshe"): Promise<QuotaEntry | void> {
     if (provider === "cloudflare") {
+      const cached = await this.readQuotaCache();
+      if (cached === null) return;
       await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
       return;
     }
@@ -652,10 +660,10 @@ export class DatabaseManager {
     try {
       const { client } = await this.getClientForAccount(accountId);
       if (!(client instanceof DNSHEClient)) {
-        await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+        await this.removeAccountFromQuotaCache(accountId);
         return;
       }
-      const qRes = await client.getQuota();
+      const qRes = await client.getQuota(8000);
       entry = qRes && qRes.success
         ? { account_id: accountId, alias, ...qRes.quota }
         : { account_id: accountId, alias, error: qRes?.message || "获取额度失败" };
@@ -663,7 +671,8 @@ export class DatabaseManager {
       entry = { account_id: accountId, alias, error: e instanceof Error ? e.message : "获取额度失败" };
     }
 
-    await this.writeQuotaCache([...cached.filter((q) => Number(q.account_id) !== accountId), entry]);
+    await this.saveAccountQuota(accountId, alias, entry);
+    return entry;
   }
 
   // ===== 会话 (Session) 管理 =====

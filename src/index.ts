@@ -2425,12 +2425,13 @@ async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: A
     if (!(client instanceof DNSHEClient)) {
       throw new Error("该账号不支持配额查询");
     }
-    const qRes = await client.getQuota();
+    const qRes = await client.getQuota(8000);
     if (qRes && qRes.success) {
       return {
         account_id: acc.id,
         alias: acc.alias,
-        ...qRes.quota
+        ...qRes.quota,
+        fetched_at: Date.now(),
       };
     }
     throw new Error(qRes.message || "获取额度失败");
@@ -2445,7 +2446,8 @@ async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: A
     return {
       account_id: accounts[idx].id,
       alias: accounts[idx].alias,
-      error: result.reason?.message || "获取额度失败"
+      error: result.reason?.message || "获取额度失败",
+      fetched_at: Date.now(),
     };
   });
 
@@ -2458,11 +2460,17 @@ app.get("/api/quota", async (c) => {
   const forceRefresh = c.req.query("refresh") === "1";
 
   try {
-    // 读操作默认只命中缓存，不调用上游 API（除非显式强制刷新）
+    // 配额是注册资格，旧版长寿命缓存不能无限期作为当前余额。
     if (!forceRefresh) {
       const cached = await dbManager.getCache(cacheKey);
       if (cached) {
-        return c.json(successRes({ quotas: JSON.parse(cached) }));
+        let quotas;
+        try { quotas = JSON.parse(cached); } catch { quotas = null; }
+        const accounts = (await dbManager.getAccounts()).filter((a) => a.provider !== "cloudflare");
+        if (Array.isArray(quotas) && quotas.length === accounts.length && accounts.every((a) =>
+          quotas.some((q) => Number(q.account_id) === a.id && !q.error
+            && Number.isFinite(q.fetched_at) && Date.now() >= q.fetched_at && Date.now() - q.fetched_at < 60_000)
+        )) return c.json(successRes({ quotas }));
       }
     }
 
@@ -3040,6 +3048,10 @@ app.post("/api/domains/register", async (c) => {
   const dbManager = c.get("db");
   let target = "";
   let targetAccount = "";
+  let registrationRoot = "";
+  let registrationAccountId: number | null = null;
+  let registrationAlias = "";
+  let createAttempted = false;
 
   try {
     const { account_id, subdomain, rootdomain } = await c.req.json();
@@ -3049,7 +3061,7 @@ app.post("/api/domains/register", async (c) => {
       return c.json(errorRes("必须提供 account_id, subdomain 及 rootdomain", "bad_request"), 400);
     }
 
-    const { client } = await dbManager.getClientForAccount(account_id);
+    const { client, alias } = await dbManager.getClientForAccount(account_id);
     // 在线注册是 DNSHE 免费子域名专属能力
     if (!(client instanceof DNSHEClient)) {
       return c.json(errorRes("仅 DNSHE 账号支持在线注册子域名", "not_supported"), 400);
@@ -3057,6 +3069,26 @@ app.post("/api/domains/register", async (c) => {
     // 中文等非 ASCII 域名统一转 Punycode (xn--) 后再送往上游 DNSHE API
     const asciiSub = toASCII(String(subdomain).trim());
     const asciiRoot = toASCII(String(rootdomain).trim());
+    registrationRoot = asciiRoot.toLowerCase();
+    registrationAccountId = Number(account_id);
+    registrationAlias = alias;
+    // 提交前只核实目标账号，不能相信浏览器或本地快照中的旧余额。
+    const quotaRes = await client.getQuota(8000);
+    const quota = quotaRes.quota;
+    const amount = (value: unknown) => (typeof value === "number" || (typeof value === "string" && value.trim()))
+      && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null;
+    const used = amount(quota?.used);
+    const total = amount(quota?.total);
+    const available = amount(quota?.available) ?? (used !== null && total !== null ? Math.max(0, total - used) : null);
+    if (!quotaRes.success || available === null) {
+      await dbManager.saveAccountQuota(registrationAccountId, alias, { error: "配额响应不完整" });
+      return c.json(errorRes("暂时无法确认该账号的注册配额，请刷新后重试。", "quota_unavailable"), 502);
+    }
+    await dbManager.saveAccountQuota(registrationAccountId, alias, { ...quota });
+    if (available <= 0) {
+      return c.json(errorRes("该账号配额已用尽，请选择其他账号或前往 DNSHE 获取更多配额。", "quota_exceeded"), 400);
+    }
+    createAttempted = true;
     const res = await client.registerSubdomain(asciiSub, asciiRoot);
 
     if (res && res.success) {
@@ -3064,10 +3096,7 @@ app.post("/api/domains/register", async (c) => {
       await dbManager.writeLog("success", "api", `成功在账号 [ID: ${account_id}] 下注册了免费域名: [${fullDomain}]`);
       // 注册会消耗配额，回源刷新配额缓存，保证后续读操作命中最新数据
       try {
-        const { accounts, quotas } = await fetchAllQuotas(dbManager);
-        if (accounts.length > 0) {
-          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
-        }
+        await dbManager.refreshAccountQuotaCache(registrationAccountId, alias);
       } catch (e) {
         console.error("注册后刷新配额缓存失败:", e);
       }
@@ -3099,8 +3128,25 @@ app.post("/api/domains/register", async (c) => {
       throw new Error(res.message || "注册子域名失败");
     }
   } catch (e: unknown) {
+    // 配额可能在校验与创建之间耗尽；失败后也回填目标账号，绝不重放创建。
+    let exhaustedAfterFailure = false;
+    if (registrationAccountId !== null && createAttempted) {
+      const refreshed = await dbManager.refreshAccountQuotaCache(registrationAccountId, registrationAlias);
+      exhaustedAfterFailure = Boolean(refreshed && !refreshed.error
+        && (typeof refreshed.available === "number" || (typeof refreshed.available === "string" && refreshed.available.trim() !== ""))
+        && Number.isFinite(Number(refreshed.available)) && Number(refreshed.available) <= 0);
+    } else if (registrationAccountId !== null) {
+      await dbManager.saveAccountQuota(registrationAccountId, registrationAlias, { error: e instanceof Error ? e.message : "配额读取失败" });
+    }
     if (e instanceof DNSHEApiError) {
-      const translated = translateUpstreamError(e.message, e.code);
+      const taskRequired = createAttempted && e.status === 403
+        && ["l.cd", "us.ci", "bot.cd", "new.tg"].includes(registrationRoot)
+        && ["dnshe_upstream_forbidden", "registration_tasks_required"].includes(e.code);
+      const translated = exhaustedAfterFailure && (e.code === "dnshe_upstream_forbidden" || e.code === "quota_exceeded")
+        ? { message: "该账号配额已用尽，请选择其他账号或前往 DNSHE 获取更多配额。", errorCode: "quota_exceeded" }
+        : taskRequired
+        ? { message: "请先前往 DNSHE 奖励中心，完成该后缀要求的任务后再注册。", errorCode: "registration_tasks_required" }
+        : translateUpstreamError(e.message, e.code);
       const code = translated.errorCode === "internal_error" ? e.code : translated.errorCode;
       await dbManager.writeLog("warning", "api", `域名注册失败 [${target}]（账号 ${targetAccount}）：${translated.message}`, { error_code: code, ...(e.diagnostic ? { upstream: e.diagnostic } : {}) });
       const failure = accountBindingFailure(e);

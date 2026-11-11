@@ -5,6 +5,7 @@
  * 不登录远端、不写业务数据、不占用前台键鼠。
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
@@ -39,6 +40,8 @@ const { chromium } = await import(process.env.REVIEW_PLAYWRIGHT
   ? pathToFileURL(process.env.REVIEW_PLAYWRIGHT).href
   : "playwright");
 const browser = await chromium.launch({ headless: true });
+const shotDir = process.env.REGISTER_DDNS_SHOT_DIR;
+if (shotDir) fs.mkdirSync(shotDir, { recursive: true });
 const report = { passed: false, tests: [], requests: [], pageErrors: [] };
 
 const check = async (name, action) => {
@@ -72,20 +75,34 @@ page.setDefaultTimeout(9000);
 page.on("pageerror", (error) => report.pageErrors.push(error.message));
 let whoisResponseMode = "available";
 let quotaMode = "available";
+let registerAttempts = 0;
+let registerMode = 'failure';
+let registeredDomain = null;
 
 await page.route("**/*", async (route) => {
   const request = route.request();
   const url = new URL(request.url());
   if (url.origin !== base.origin) return route.abort();
   if (!url.pathname.startsWith("/api/")) return route.continue();
-  report.requests.push({ method: request.method(), path: url.pathname });
+  report.requests.push({ method: request.method(), path: url.pathname, search: url.search });
+  if (url.pathname === "/api/domains/register") {
+    registerAttempts++;
+    quotaMode = "exhausted";
+    if (registerMode === 'success') {
+      const input = request.postDataJSON();
+      registeredDomain = { id: 301, account_id: 1, full_domain: `${input.subdomain}.${input.rootdomain}`, subdomain: input.subdomain, rootdomain: input.rootdomain, status: 'active', expires_at: '2099-01-01' };
+      return route.fulfill({ json: { success: true, full_domain: registeredDomain.full_domain, cache_sync: 'synced' } });
+    }
+    return route.fulfill({ status: 400, json: { success: false, error_code: "quota_exceeded", message: "该账号配额已用尽，请选择其他账号。" } });
+  }
+  if (url.pathname === "/api/domains/sync") return route.fulfill({ json: { success: true, synced: [{ id: 1, checked: 0 }], failed: [], remaining: [], done: true } });
   if (url.pathname === "/api/auth/status") return route.fulfill({ json: { initialized: true, two_fa_enabled: false } });
   if (url.pathname === "/api/auth/account") return route.fulfill({ json: { success: true, username: "合成管理员", two_fa_enabled: false } });
   if (url.pathname === "/api/accounts") return route.fulfill({ json: { success: true, accounts: [
     { id: 1, alias: "合成账号", provider: "dnshe", api_key: "synthetic" },
     ...(quotaMode === "mixed" ? [{ id: 2, alias: "剩余额度账号", provider: "dnshe", api_key: "synthetic-2" }] : []),
   ] } });
-  if (url.pathname === "/api/domains") return route.fulfill({ json: { success: true, domains: [], last_sync: { at: null, type: "empty" } } });
+  if (url.pathname === "/api/domains") return route.fulfill({ json: { success: true, domains: registeredDomain ? [registeredDomain] : [], last_sync: { at: null, type: "empty" } } });
   if (url.pathname === "/api/overview") return route.fulfill({ json: { success: true, domains: { total: 0, active: 0, expired: 0, expiring_soon: 0, delegated: 0, not_delegated: 0 }, accounts: { total: 1, dnshe: 1, cloudflare: 0 }, quota: { total: 0, used: 0, available: 0, failed: 0, accounts: [] }, assist: null } });
   if (url.pathname === "/api/quota") return route.fulfill({ json: {
     success: true,
@@ -154,6 +171,7 @@ try {
     assert.match(await accountOption.textContent(), /已用\s*5\/5\s*·\s*配额用尽/);
     assert.equal(await registerMain.locator('#register-target-account').inputValue(), "");
     assert.equal(await registerMain.getByRole("button", { name: "一键注册该域名", exact: true }).isDisabled(), true);
+    if (shotDir) await page.screenshot({ path: path.join(shotDir, 'register-exhausted.png'), fullPage: true });
     assert.equal(await registerMain.locator('#register-target-account option[value=""]').textContent(), "所有账号配额均已用尽");
     quotaMode = "available";
     await page.reload({ waitUntil: "networkidle" });
@@ -174,6 +192,43 @@ try {
     }
   });
 
+  await check("进入与重新进入注册页均强制刷新配额，后台同步域名", async () => {
+    quotaMode = "available";
+    const before = report.requests.length;
+    await page.reload({ waitUntil: "networkidle" });
+    assert(report.requests.slice(before).some(r => r.path === "/api/quota" && r.search === "?refresh=1"));
+    assert(report.requests.slice(before).some(r => r.path === "/api/domains/sync"));
+    await page.evaluate(() => { location.hash = '#dashboard'; });
+    await page.locator('main[data-workspace="dashboard"]').waitFor();
+    quotaMode = "exhausted";
+    const reenter = report.requests.length;
+    await page.evaluate(() => { location.hash = '#register'; });
+    await registerMain.waitFor();
+    await page.waitForLoadState('networkidle');
+    assert(report.requests.slice(reenter).some(r => r.path === "/api/quota" && r.search === "?refresh=1"));
+  });
+
+  await check("注册失败后刷新配额并禁用用尽账号，不重放创建", async () => {
+    quotaMode = "available";
+    await page.reload({ waitUntil: "networkidle" });
+    await registerMain.getByRole("button", { name: /精确单域名查重/ }).click();
+    await registerMain.locator("input").first().fill("quota-race");
+    await registerMain.getByRole("button", { name: "WHOIS 查重", exact: true }).click();
+    await registerMain.getByText("尚未注册", { exact: true }).waitFor();
+    const before = report.requests.length;
+    await registerMain.getByRole("button", { name: "一键注册该域名", exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('#register-target-account option[value="1"]')?.disabled === true);
+    assert.equal(registerAttempts, 1);
+    const after = report.requests.slice(before);
+    const create = after.findIndex(r => r.path === '/api/domains/register');
+    assert(after.slice(create + 1).some(r => r.path === '/api/quota' && r.search === '?refresh=1'));
+    assert(after.some(r => r.path === '/api/domains'));
+    assert(after.some(r => r.path === '/api/overview'));
+    assert.equal(await registerMain.getByRole("button", { name: "一键注册该域名", exact: true }).isDisabled(), true);
+    quotaMode = "available";
+    await page.reload({ waitUntil: "networkidle" });
+  });
+
   await check("混合额度自动选择有剩余的账号并兼容字符串账号ID", async () => {
     quotaMode = "mixed";
     await page.reload({ waitUntil: "networkidle" });
@@ -188,6 +243,33 @@ try {
     assert.match(await select.locator('option[value="2"]').textContent(), /已用 2 · 剩余 3/);
     quotaMode = "available";
     await page.reload({ waitUntil: "networkidle" });
+  });
+
+  await check("注册成功后域名列表出现新对象，账户配额同步用尽", async () => {
+    registerMode = 'success';
+    quotaMode = 'available';
+    await page.reload({ waitUntil: 'networkidle' });
+    await registerMain.getByRole('button', { name: /精确单域名查重/ }).click();
+    await registerMain.locator('input').first().fill('registered-sync');
+    await registerMain.getByRole('button', { name: 'WHOIS 查重', exact: true }).click();
+    await registerMain.getByText('尚未注册', { exact: true }).waitFor();
+    await registerMain.getByRole('button', { name: '一键注册该域名', exact: true }).click();
+    const domainsMain = page.locator('main[data-workspace="domains"]');
+    await domainsMain.waitFor();
+    await domainsMain.getByText(registeredDomain.full_domain, { exact: true }).first().waitFor();
+    await page.evaluate(() => { location.hash = '#quota'; });
+    const quotaMain = page.locator('main[data-workspace="quota"]');
+    await quotaMain.waitFor();
+    await page.waitForLoadState('networkidle');
+    assert.equal(await quotaMain.locator('.ew-quota-summary > div > strong').textContent(), '0');
+    assert.equal(await quotaMain.locator('.ew-quota-focus-facts b').first().textContent(), '5');
+    if (shotDir) await page.screenshot({ path: path.join(shotDir, 'quota-after-registration.png'), fullPage: true });
+    await page.evaluate(() => { location.hash = '#register'; });
+    await registerMain.waitFor();
+    registerMode = 'failure';
+    registeredDomain = null;
+    quotaMode = 'available';
+    await page.reload({ waitUntil: 'networkidle' });
   });
 
   await check("账号默认全选，取消全部或最后一项不会意外恢复全选，空范围不能启动", async () => {
@@ -392,7 +474,7 @@ try {
     assert((await ddnsMain.getByText("仅演示 · 无真实令牌", { exact: true }).count()) === 2);
   });
 } finally {
-  report.passed = report.tests.length === 16 && report.tests.every((test) => test.passed) && report.pageErrors.length === 0;
+  report.passed = report.tests.length === 19 && report.tests.every((test) => test.passed) && report.pageErrors.length === 0;
   await browser.close();
   if (devServer?.pid && process.platform === "win32") {
     // 同步等待进程树退出，避免测试结束后留下占用 3016 的 Vite 子进程。

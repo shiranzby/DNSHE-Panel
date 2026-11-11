@@ -2,6 +2,20 @@
 
 ## 结论与边界
 
+### 2026-11-12 复核
+
+重新读取 issue，仍为原始 520 报告，没有补充评论。按授权生成一组随机无效 Key/Secret：
+
+| 路径 | 实测结果 |
+| --- | --- |
+| 本地直连 `quota` | HTTP 401，`auth_invalid_credentials`，JSON |
+| 本地直连 `keys/list` | HTTP 401，`auth_invalid_credentials`，JSON |
+| 已部署 Workers 添加账号 | 面板 HTTP 400，`auth_invalid_credentials`，未新增账号 |
+
+生产路径只提交一次无效绑定测试，前后账号 ID 集合一致，独立诊断会话已注销。没有使用真实 DNSHE 凭据，也没有注册域名。公开脚本 `node scripts/diagnose-dnshe-invalid-key.mjs --live-readonly` 仅重现前两项；生产路径操作与证据保留在仓库外，不把个人实例或登录配置公开。
+
+这证明当前错误凭据有正常的拒绝路径，未重现原 520。原故障仍可能属于上游边缘／回源或特定出口的暂时异常，不能仅凭截图断言是哪一层；也不应将“换密钥”当作已证实解法。本轮配额缓存修复针对创建域名的 403，与添加账号 520 分开处理。未评论或关闭 issue。
+
 [原始 issue](https://github.com/shiranzby/DNSHE-Panel/issues/3) 的截图为“无法验证 API 密钥有效性: HTTP error! status: 520”。报错来自面板服务端调用 DNSHE 校验接口，不是浏览器直接调用 DNSHE，也不是面板登录失败。
 
 Cloudflare 将 520 定义为源站返回空、未知或异常响应。源站异常、回源协议问题、出口或防火墙限制都是可能原因；截图不足以确定其中哪一个，也不能证明密钥无效。参考 [Cloudflare 官方 520 说明](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-520/)。
@@ -47,7 +61,7 @@ curl --silent --show-error --max-time 15 --dump-header - \
 - 校验失败零账号写入；更换凭据失败保留原账号、别名与密文。
 - 注册路径同样保留 V2 错误码、HTTP 状态、响应类型和 Ray ID，失败写脱敏日志；403/429 不盲目回退旧接口重试写入。上游消息回显的凭据被替换，不保存完整错误页。
 
-验证：`npm run test:accounts:binding`，23/23 通过，包括初版 15 项绑定验证和新增 8 项注册诊断；Docker 构建已加入此项闸门。回归使用本地夹具与内存 SQLite，不使用真人凭据。用户随后另行授权在自用实例部署诊断并尝试一个指定域名；该次实网请求收到 520，独立只读查询确认域名未注册、配额未变。未向 issue 发消息或关闭问题。
+验证：`npm run test:accounts:binding`，当前 37/37 通过，含绑定、注册诊断与配额时效反例；Docker 构建已加入此项闸门。回归使用本地夹具与内存 SQLite，不使用真人凭据。历史版本 23/23 通过后，用户曾另行授权在自用实例部署诊断并尝试一个指定域名；该次实网请求收到 520，独立只读查询确认域名未注册、配额未变。未向 issue 发消息或关闭问题。
 
 自有环境的对照结果为：同一凭据在本地读取 WHOIS/配额成功，Workers HKG 路径却收到 520。这支持“访问路径存在差异”，不等于已经证明 DNSHE 源站故障或刻意屏蔽，也不能替代报告者自己的日志。无凭据的公共 WHOIS 当前可能要求认证，不应再假定匿名查询一定可用。
 

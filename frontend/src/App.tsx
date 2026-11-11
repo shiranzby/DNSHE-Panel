@@ -835,6 +835,9 @@ export default function App() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [quotas, setQuotas] = useState<Quota[]>([]);
+  const quotaRequestRef = useRef<{ forced: boolean; promise: Promise<void> } | null>(null);
+  const domainSyncRunningRef = useRef(false);
+  const backgroundSyncAtRef = useRef(0);
   const [logs, setLogs] = useState<AppLog[]>([]);
 
   // 账号筛选、DNS 类型与下拉菜单状态
@@ -2059,8 +2062,8 @@ export default function App() {
 };
 
   // 1. 获取所有域名列表（支持按账号筛选）
-  const fetchDomains = async (accountIdFilter?: string) => {
-    setLoadingDomains(true);
+  const fetchDomains = async (accountIdFilter?: string, silent = false) => {
+    if (!silent) setLoadingDomains(true);
     try {
       const targetAcc = accountIdFilter ?? selectedAccountFilter;
       const accParam = targetAcc && targetAcc !== "all" ? `&account_id=${targetAcc}` : "";
@@ -2086,7 +2089,7 @@ export default function App() {
     } catch (e) {
       showToast("error", "网络连接异常，无法获取域名列表");
     } finally {
-      setLoadingDomains(false);
+      if (!silent) setLoadingDomains(false);
     }
   };
 
@@ -2570,7 +2573,8 @@ export default function App() {
     overviewRefreshRef.current = true;
     setRefreshingOverviewWorkspace(true);
     try {
-      // 读取三个可见来源的现有快照；上游强制采集仍由 CF 用量页明确触发。
+      await handleSyncDomains({ silent: true });
+      // 配额和域名后台更新后，再读取可见来源；CF 强制采集由用量页触发。
       await Promise.all([fetchOverview(true), fetchDomains("all"), fetchCfQuota()]);
     } finally {
       overviewRefreshRef.current = false;
@@ -2996,19 +3000,31 @@ export default function App() {
     }
   };
 
-  const fetchQuotas = async (forceRefresh = false) => {
-    setLoadingQuotas(true);
-    try {
-      const res = await apiFetch(`/api/quota${forceRefresh ? "?refresh=1" : ""}`);
-      const data = await res.json();
-      if (data.success) {
-        setQuotas(data.quotas || []);
-      }
-    } catch (e) {
-      showToast("error", "获取账户配额失败");
-    } finally {
-      setLoadingQuotas(false);
+  const fetchQuotas = async (forceRefresh = false): Promise<void> => {
+    const pending = quotaRequestRef.current;
+    if (pending) {
+      await pending.promise;
+      if (!forceRefresh || pending.forced) return;
+      // 普通缓存读取不能吞掉稍后到来的强制刷新。
+      return fetchQuotas(true);
     }
+    const promise = (async () => {
+      setLoadingQuotas(true);
+      try {
+        const res = await apiFetch(`/api/quota${forceRefresh ? "?refresh=1" : ""}`);
+        const data = await res.json();
+        if (data.success) {
+          setQuotas(data.quotas || []);
+        }
+      } catch (e) {
+        showToast("error", "获取账户配额失败");
+      } finally {
+        setLoadingQuotas(false);
+      }
+    })();
+    quotaRequestRef.current = { forced: forceRefresh, promise };
+    try { await promise; }
+    finally { if (quotaRequestRef.current?.promise === promise) quotaRequestRef.current = null; }
   };
 
   // 4. 获取日志列表
@@ -3236,6 +3252,7 @@ export default function App() {
     if (!sessionToken) return;
     // 换会话（登录 / 重新登录）时清空时效记录，让下面的按需拉取重新跑一轮
     tabDataFetchedAtRef.current = {};
+    backgroundSyncAtRef.current = 0;
     cfFetchedAtRef.current = 0;
     fetchAccounts();
     fetchDomains();
@@ -3297,16 +3314,33 @@ export default function App() {
         void fetchCfQuota({ silent: true }); // 数据旧了：静默更新，不闪
       }
     } else if (activeTab === "quota") {
-      fetchIfStale("quota", 60_000, fetchQuotas);
+      void fetchQuotas(true);
     } else if (activeTab === "register") {
-      // 注册结果出现后要立即给出真实账号额度；没有额度快照时不凭空禁用账号。
-      fetchIfStale("quota", 60_000, fetchQuotas);
+      void fetchQuotas(true);
     } else if (activeTab === "settings") {
       fetchIfStale("settings", Infinity, fetchSettings);
       fetchIfStale("account", Infinity, fetchAccountInfo);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, sessionToken]);
+
+  // 先展示本地数据，再增量同步上游；进入工作面及回到窗口时后台更新。
+  useEffect(() => {
+    if (!sessionToken || !accounts.length || !["dashboard", "domains", "accounts", "register", "quota"].includes(activeTab)) return;
+    const refresh = () => {
+      if (document.visibilityState === "hidden" || domainSyncRunningRef.current || Date.now() - backgroundSyncAtRef.current < 60_000) return;
+      backgroundSyncAtRef.current = Date.now();
+      void handleSyncDomains({ silent: true });
+    };
+    refresh();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, sessionToken, accounts.length]);
 
   // 域名搜索索引：full_domain 在库中一律以 Punycode(xn--) 存储，
   // 而列表展示的是解码后的中文，直接拿中文关键词匹配 ASCII 串永远搜不到。
@@ -3599,9 +3633,14 @@ export default function App() {
    * NOTE: 进度以**域名**为单位（复核过的 / 复核过的 + 还欠着的），
    * 而不是账号数 —— 账号会被拆到多轮里，按账号计会重复计数（§8）。
    */
-  const handleSyncDomains = async () => {
-    setActionLoading("sync");
-    setSyncProgress({ done: 0, total: 0 });
+  const handleSyncDomains = async (options?: { silent?: boolean }) => {
+    if (domainSyncRunningRef.current) return;
+    domainSyncRunningRef.current = true;
+    const silent = options?.silent === true;
+    if (!silent) {
+      setActionLoading("sync");
+      setSyncProgress({ done: 0, total: 0 });
+    }
     try {
       let remaining: number[] | null = null;
       let round = 0;
@@ -3620,7 +3659,7 @@ export default function App() {
         });
         const data = await res.json();
         if (!data.success) {
-          showToast("error", data.message || "启动同步域名任务失败");
+          if (!silent) showToast("error", data.message || "启动同步域名任务失败");
           return;
         }
         for (const s of data.synced || []) {
@@ -3631,10 +3670,10 @@ export default function App() {
         for (const f of data.failed || []) failedAliases.push(f.alias);
         leftDomains = data.pending || 0;
         remaining = data.remaining && data.remaining.length ? data.remaining : null;
-        setSyncProgress({ done: checkedDomains, total: checkedDomains + leftDomains });
-      } while (remaining && round < 40);
+        if (!silent) setSyncProgress({ done: checkedDomains, total: checkedDomains + leftDomains });
+      } while (remaining && round < (silent ? 3 : 40));
 
-      await fetchDomains();
+      await fetchDomains(silent ? "all" : undefined, silent);
       // 三种收尾状态都要说出来，不能只报「已同步」（§8）
       const notes: string[] = [];
       if (failedAliases.length > 0) {
@@ -3648,15 +3687,20 @@ export default function App() {
       }
       const summary = `已同步 ${doneAccounts.size} 个账号的域名` +
         (checkedDomains > 0 ? `（本次复核 ${checkedDomains} 个变更）` : "，全部为最新");
-      showToast(
+      if (!silent) showToast(
         notes.length > 0 ? "warning" : "success",
         notes.length > 0 ? `${summary}；${notes.join("；")}` : summary
       );
     } catch (e) {
-      showToast("error", "发起域名同步网络请求失败");
+      if (!silent) showToast("error", "发起域名同步网络请求失败");
     } finally {
-      setActionLoading(null);
-      setSyncProgress(null);
+      await fetchQuotas(true);
+      void fetchOverview(!silent);
+      domainSyncRunningRef.current = false;
+      if (!silent) {
+        setActionLoading(null);
+        setSyncProgress(null);
+      }
     }
   };
 
@@ -5872,7 +5916,6 @@ export default function App() {
         showToast("success", data.cache_sync === "pending" ? `域名 [${registeredDomain}] 已注册，正在同步列表…` : `🎉 域名 [${registeredDomain}] 注册成功！`);
         setWhoisResult(null);
         setSearchSubdomain("");
-        void fetchQuotas(true);
         setActiveTab("domains");
         void waitForRegisteredDomain(registeredDomain);
       } else {
@@ -5881,6 +5924,12 @@ export default function App() {
     } catch (err) {
       showToast("error", "注册请求失败，请重试");
     } finally {
+      invalidateQuotaTabCache();
+      // 写操作后的刷新不能合并进写操作前已经发出的请求。
+      await quotaRequestRef.current?.promise;
+      await fetchQuotas(true);
+      void fetchDomains();
+      void fetchOverview(true);
       setActionLoading(null);
     }
   };
@@ -7260,7 +7309,7 @@ export default function App() {
           {/* 域名页快捷同步 */}
           {activeTab === "domains" && (
             <button
-              onClick={handleSyncDomains}
+              onClick={() => void handleSyncDomains()}
               disabled={actionLoading === "sync" || loadingDomains}
               className="btn-primary h-10 px-2.5 sm:px-3.5 rounded text-sm font-semibold text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
             >
@@ -10847,7 +10896,7 @@ export default function App() {
               </div>
             </div>
             
-            {loadingQuotas ? (
+            {loadingQuotas && quotas.length === 0 ? (
               <div className="flex justify-center py-20">
                 <RefreshCw className="w-8 h-8 animate-spin text-primary" />
               </div>

@@ -21,7 +21,7 @@ const edgeError = () => new Response('<html>synthetic upstream edge error; never
 let passed = 0;
 let failed = 0;
 
-async function fixture(upstream, run, { existing = false } = {}) {
+async function fixture(upstream, run, { existing = false, quota = () => json({ success: true, quota: { used: 1, total: 8, available: 7 } }) } = {}) {
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec(readFileSync(path.join(repo, 'schema.sql'), 'utf8'));
   const DB = createD1FromSqlite(sqlite);
@@ -31,21 +31,28 @@ async function fixture(upstream, run, { existing = false } = {}) {
   if (existing) sqlite.prepare('INSERT INTO accounts(id,alias,api_key,api_secret,provider) VALUES(1,?,?,?,?)')
     .run('Original alias', 'old-synthetic-key', await encryptText('old-synthetic-secret', env.AES_KEY), 'dnshe');
   const calls = [];
+  const quotaCalls = [];
   const tasks = [];
+  let requestRoute = '';
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input));
     assert.equal(url.hostname, 'api005.dnshe.com', 'all outbounds must be synthetic DNSHE requests');
     const call = { endpoint: url.searchParams.get('endpoint'), action: url.searchParams.get('action'), method: init.method, body: init.body ? JSON.parse(init.body) : undefined, headers: new Headers(init.headers), signal: init.signal };
+    if (existing && call.endpoint === 'quota' && (requestRoute.startsWith('/api/quota') || requestRoute === '/api/domains/register')) {
+      quotaCalls.push(call);
+      return quota(call, quotaCalls.length);
+    }
     calls.push(call);
     return upstream(call);
   };
   async function request(body, route = '/api/accounts', method = 'POST') {
+    requestRoute = route;
     const response = await worker.fetch(new Request(`https://synthetic.invalid${route}`, {
-      method, headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      method, headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}`, 'Content-Type': 'application/json' }, body: method === 'GET' ? undefined : JSON.stringify(body),
     }), env, { waitUntil(task) { tasks.push(task); }, passThroughOnException() {} });
     return { status: response.status, body: await response.json() };
   }
-  try { await run({ request, calls, tasks, sqlite, env }); }
+  try { await run({ request, calls, quotaCalls, tasks, sqlite, env }); }
   finally { await Promise.allSettled(tasks); globalThis.fetch = originalFetch; sqlite.close(); }
 }
 
@@ -179,8 +186,87 @@ for (const alias of ['', 'Synthetic alias']) {
   }));
 }
 
-const registration = { account_id: 1, subdomain: 'synthetic-register-test', rootdomain: 'l.cd' };
+const registration = { account_id: 1, subdomain: 'synthetic-register-test', rootdomain: 'de5.net' };
 const registrationDomain = `${registration.subdomain}.${registration.rootdomain}`;
+
+await test('stale available quota cannot cause a create request for an exhausted account', () => fixture(() => { throw new Error('must not create'); }, async ({ request, calls, quotaCalls, sqlite }) => {
+  sqlite.prepare('INSERT INTO cache(key,value,expires_at) VALUES(?,?,?)').run('api_cache:quota', JSON.stringify([{ account_id: 1, available: 7 }]), 4e9);
+  const result = await request({ ...registration, rootdomain: 'l.cd' }, '/api/domains/register');
+  assert.equal(result.body.error_code, 'quota_exceeded');
+  assert.match(result.body.message, /配额已用尽/);
+  assert(!result.body.message.includes('奖励中心'));
+  assert.equal(calls.length, 0);
+  assert.equal(quotaCalls.length, 1);
+  const saved = JSON.parse(sqlite.prepare('SELECT value FROM cache WHERE key=?').get('api_cache:quota').value);
+  assert.equal(saved[0].available, 0);
+}, { existing: true, quota: () => json({ success: true, quota: { used: 8, total: 8, available: 0 } }) }));
+
+await test('quota consumed between check and create is refreshed without replaying registration', () => fixture(() => new Response('Forbidden', { status: 403 }), async ({ request, calls, quotaCalls, sqlite }) => {
+  const result = await request({ ...registration, rootdomain: 'l.cd' }, '/api/domains/register');
+  assert.equal(result.body.error_code, 'quota_exceeded');
+  assert.equal(result.body.upstream.status, 403);
+  assert.equal(calls.length, 1);
+  assert.equal(quotaCalls.length, 2);
+  const saved = JSON.parse(sqlite.prepare('SELECT value FROM cache WHERE key=?').get('api_cache:quota').value);
+  assert.equal(saved[0].alias, 'Original alias');
+  assert.equal(saved[0].available, 0);
+}, { existing: true, quota: (_call, n) => json({ success: true, quota: { used: n === 1 ? 7 : 8, total: 8, available: n === 1 ? 1 : 0 } }) }));
+
+await test('unreadable quota prevents create and retains upstream diagnostics', () => fixture(() => { throw new Error('must not create'); }, async ({ request, calls, quotaCalls }) => {
+  const result = await request(registration, '/api/domains/register');
+  assert.equal(result.body.error_code, 'dnshe_upstream_error');
+  assert.equal(result.body.upstream.status, 520);
+  assert.equal(calls.length, 0);
+  assert.equal(quotaCalls.length, 1);
+}, { existing: true, quota: edgeError }));
+
+await test('missing quota fields cannot silently authorize registration', () => fixture(() => { throw new Error('must not create'); }, async ({ request, calls }) => {
+  const result = await request(registration, '/api/domains/register');
+  assert.equal(result.body.error_code, 'quota_unavailable');
+  assert.equal(calls.length, 0);
+}, { existing: true, quota: () => json({ success: true, quota: { available: null } }) }));
+
+await test('legacy and expired quota caches refresh, fresh results are reused, explicit refresh bypasses', () => fixture(() => { throw new Error('unexpected request'); }, async ({ request, sqlite, quotaCalls }) => {
+  sqlite.prepare('INSERT INTO cache(key,value,expires_at) VALUES(?,?,?)').run('api_cache:quota', JSON.stringify([{ account_id: 1, available: 7 }]), 4e9);
+  for (const fetched_at of [undefined, Date.now() - 61_000]) {
+    sqlite.prepare('UPDATE cache SET value=? WHERE key=?').run(JSON.stringify([{ account_id: 1, available: 7, fetched_at }]), 'api_cache:quota');
+    const result = await request(null, '/api/quota', 'GET');
+    assert.equal(result.body.quotas[0].available, 0);
+  }
+  assert.equal(quotaCalls.length, 2);
+  await request(null, '/api/quota', 'GET');
+  assert.equal(quotaCalls.length, 2);
+  await request(null, '/api/quota?refresh=1', 'GET');
+  assert.equal(quotaCalls.length, 3);
+}, { existing: true, quota: () => json({ success: true, quota: { used: 8, total: 8, available: 0 } }) }));
+
+const taskMessage = '请先前往 DNSHE 奖励中心，完成该后缀要求的任务后再注册。';
+for (const rootdomain of ['l.cd', 'us.ci', 'bot.cd', 'new.tg', 'US.CI']) {
+  await test(`registration ${rootdomain} 403 shows the requested reward-task hint`, () => fixture(() => new Response('<html>Forbidden</html>', { status: 403, headers: { 'CF-Ray': ray } }), async ({ request, calls, sqlite }) => {
+    const result = await request({ ...registration, rootdomain }, '/api/domains/register');
+    assert.equal(result.status, 400, 'upstream denial must not invalidate the panel session');
+    assert.equal(result.body.message, taskMessage);
+    assert.equal(result.body.error_code, 'registration_tasks_required');
+    assert.equal(result.body.upstream.status, 403);
+    assert.equal(result.body.upstream.ray_id, ray);
+    assert.equal(calls.length, 1);
+    assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM domains_cache').get().n, 0);
+    assert(sqlite.prepare("SELECT message FROM logs WHERE category='api'").get().message.includes(taskMessage));
+  }, { existing: true }));
+}
+for (const code of ['auth_ip_not_allowed', 'api_access_disabled', 'auth_invalid_credentials']) {
+  await test(`registration l.cd explicit ${code} keeps its original diagnosis`, () => fixture(() => json({ success: false, error_code: code, message: 'Explicit credential rejection' }, 403), async ({ request }) => {
+    const result = await request({ ...registration, rootdomain: 'l.cd' }, '/api/domains/register');
+    assert.equal(result.body.error_code, code);
+    assert.notEqual(result.body.message, taskMessage);
+  }, { existing: true }));
+}
+await test('registration l.cd 520 is not mislabeled as an incomplete reward task', () => fixture(edgeError, async ({ request }) => {
+  const result = await request({ ...registration, rootdomain: 'l.cd' }, '/api/domains/register');
+  assert.equal(result.body.error_code, 'dnshe_upstream_error');
+  assert.equal(result.body.upstream.status, 520);
+  assert.notEqual(result.body.message, taskMessage);
+}, { existing: true }));
 for (const scenario of [
   { name: 'API IP allowlist', code: 'auth_ip_not_allowed', message: 'IP not allowed' },
   { name: 'API disabled', code: 'api_access_disabled', message: 'API access disabled' },
@@ -236,16 +322,20 @@ for (const legacy of [false, true]) {
     if (call.endpoint === 'dns_records') return json({ success: true, records: [] });
     throw new Error('Unexpected synthetic request');
   }, async ({ request, calls, sqlite }) => {
+    sqlite.prepare('INSERT INTO cache(key,value,expires_at) VALUES(?,?,?)').run('api_cache:quota', JSON.stringify([{ account_id: 2, alias: 'Other account', used: 2, available: 6, total: 8 }]), 4e9);
     const result = await request(registration, '/api/domains/register');
     assert.equal(result.status, 200);
     assert.equal(result.body.success, true);
     assert.equal(result.body.cache_sync, 'synced');
     assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM domains_cache').get().n, 1);
+    const quotas = JSON.parse(sqlite.prepare('SELECT value FROM cache WHERE key=?').get('api_cache:quota').value);
+    assert.equal(quotas.find(q => q.account_id === 1).available, 6, 'post-create quota must replace the preflight snapshot');
+    assert.equal(quotas.find(q => q.account_id === 2).available, 6, 'other accounts remain intact');
     const writes = calls.filter(call => call.method === 'POST');
     assert.equal(writes.length, legacy ? 2 : 1);
     assert.deepEqual(writes[0].body, { subdomain: registration.subdomain, domain: registration.rootdomain });
     if (legacy) assert.deepEqual(writes[1].body, { subdomain: registration.subdomain, rootdomain: registration.rootdomain });
-  }, { existing: true }));
+  }, { existing: true, quota: (_call, n) => json({ success: true, quota: { used: n, total: 8, available: 8 - n } }) }));
 }
 
 console.log(JSON.stringify({ passed, failed, network: 'mock-only', storage: 'in-memory SQLite' }));
