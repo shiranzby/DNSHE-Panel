@@ -60,11 +60,22 @@ type Bindings = {
   ASSIST_KV?: KVNamespace;
 };
 
+/** 绑定记录里的 Cloudflare Account ID（不是面板本地 accounts.id）。 */
+function readCloudflareAccountId(apiKey: unknown): string | null {
+  const match = /^cf:([a-f\d]{32})$/i.exec(String(apiKey ?? "").trim());
+  return match ? match[1].toLowerCase() : null;
+}
+
 // NOTE: 深度同步 Cloudflare 账号的 zone 列表。zones 拉取成功即视为权威结论——
 // 上游删掉的 zone 会由 syncAccountDomains 的差集清理逻辑移除，包括 0 个 zone 的情况。
 // zone → 上游行 的映射复用 cloudflare.ts 的 mapZoneToUpstream。
+// 关键约束：必须按当前绑定的真实 Account ID 过滤，不能把同一 Token 可见的其它账号
+// zone 混进当前面板账号；否则同名 zone 会让域名委派看起来写到了错误账号。
 async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number, client: CloudflareClient): Promise<number> {
-  const zones = await client.listZones();
+  const account = (await dbManager.getAccounts("cloudflare")).find((item) => item.id === accountId);
+  const cloudflareAccountId = readCloudflareAccountId(account?.api_key);
+  if (!cloudflareAccountId) throw new Error("Cloudflare 绑定缺少真实 Account ID，已停止同步以避免串入其它账号的 zone");
+  const zones = await client.listZones(cloudflareAccountId);
   await dbManager.syncAccountDomains(accountId, zones.map(mapZoneToUpstream));
   return zones.length;
 }
@@ -1710,6 +1721,135 @@ app.post("/api/domains/:id/delegate-cloudflare", async (c) => {
       cf_account_alias: cfAccount.alias,
     })
   );
+});
+
+/**
+ * 取消 Cloudflare 委派：恢复 DNSHE 默认 NS，并删除已确认归属的 Cloudflare zone。
+ *
+ * 顺序刻意是「先恢复权威 NS，再删 zone」：Cloudflare 删除失败时，域名仍能继续由
+ * DNSHE 解析；反过来先删 zone 会留下指向不存在权威服务器的 DNS 空窗。
+ * DNSHE 的默认 NS 是注册商侧状态，不需要再写两条 `ns1/ns2.dnshe.com` 记录；删除
+ * 外部 NS 记录后由上游恢复默认状态，响应中明确返回默认 NS 供前端展示。
+ */
+app.post("/api/domains/:id/undelegate-cloudflare", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+  let body: Record<string, unknown> = {};
+  try { body = await c.req.json(); } catch { body = {}; }
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  const domainInfo = await dbManager.getDomainById(domainId);
+  if (!domainInfo) return c.json(errorRes("未找到域名记录", "not_found"), 404);
+  const { client: dnsheClient, alias: dnsheAlias } = await dbManager.getClientForAccount(domainInfo.account_id);
+  if (!(dnsheClient instanceof DNSHEClient)) {
+    return c.json(errorRes("该域名不是 DNSHE 账号下的域名，不能从此处取消 Cloudflare 委派", "not_dnshe_domain"), 400);
+  }
+
+  const cfAccounts = await dbManager.getAccounts("cloudflare");
+  const requestedCfId = body.cf_account_id === undefined || body.cf_account_id === null || body.cf_account_id === ""
+    ? null : parseInt(String(body.cf_account_id), 10);
+  const cfAccount = requestedCfId
+    ? cfAccounts.find((account) => account.id === requestedCfId)
+    : cfAccounts.length === 1 ? cfAccounts[0] : undefined;
+  if (!cfAccount) {
+    return c.json(errorRes(
+      cfAccounts.length === 0 ? "还没有绑定 Cloudflare 账号，无法确认要删除的 zone" : "请选择当前域名所属的 Cloudflare 账号后再取消委派",
+      cfAccounts.length === 0 ? "cf_account_missing" : "cf_account_required"
+    ), 400);
+  }
+  const cloudflareAccountId = readCloudflareAccountId(cfAccount.api_key);
+  if (!cloudflareAccountId) {
+    return c.json(errorRes("所选 Cloudflare 账号缺少真实 Account ID，未执行任何删除", "cf_account_identifier_missing"), 400);
+  }
+  const { client: cfClient } = await dbManager.getClientForAccount(cfAccount.id);
+  if (!(cfClient instanceof CloudflareClient)) {
+    return c.json(errorRes("所选账号不是 Cloudflare 账号", "cf_account_required"), 400);
+  }
+
+  let sourceRecords: DnsRecordInfo[];
+  try {
+    const result = await dnsheClient.listDnsRecords(domainId);
+    if (!result?.success || !Array.isArray(result.records)) throw new Error("解析记录响应不完整");
+    sourceRecords = result.records;
+  } catch (e) {
+    return c.json(errorRes(`读取 ${domainInfo.full_domain} 的当前 NS 失败，未执行取消委派：${e instanceof Error ? e.message : "请求异常"}`, "snapshot_failed"), 400);
+  }
+  const nsRecords = sourceRecords.filter((record) => String(record.type || "").toUpperCase() === "NS");
+  const cfNsRecords = nsRecords.filter((record) => /(^|\.)ns\.cloudflare\.com\.?$/i.test(String(record.content || "").trim()));
+  if (cfNsRecords.length === 0) {
+    return c.json(errorRes(
+      nsRecords.length === 0 ? `域名 [${domainInfo.full_domain}] 当前没有外部 NS，已处于 DNSHE 默认状态` : `域名 [${domainInfo.full_domain}] 的 NS 并非 Cloudflare，未执行删除`,
+      nsRecords.length === 0 ? "already_default" : "not_cloudflare_delegated"
+    ), nsRecords.length === 0 ? 200 : 409);
+  }
+
+  // 先按真实账号拉取并精确匹配 zone；不能按域名模糊删，也不能复用其它账号同名 zone。
+  let matchingZones: CfZoneInfo[];
+  try {
+    const requestedZoneId = String(body.zone_id || "").trim();
+    matchingZones = (await cfClient.listZones(cloudflareAccountId)).filter((zone) =>
+      String(zone.name || "").trim().toLowerCase() === String(domainInfo.full_domain || "").trim().toLowerCase() &&
+      (!requestedZoneId || String(zone.id) === requestedZoneId) &&
+      (!zone.account?.id || String(zone.account.id).trim().toLowerCase() === cloudflareAccountId)
+    );
+  } catch (e) {
+    return c.json(errorRes(`读取 Cloudflare zone 失败，未删除 DNSHE NS：${e instanceof Error ? e.message : "请求异常"}`, "zone_lookup_failed"), 502);
+  }
+  if (matchingZones.length > 1) {
+    return c.json(errorRes(`Cloudflare 账号 ${cfAccount.alias} 下存在多个同名 zone，已停止以避免误删`, "zone_not_unique"), 409);
+  }
+  const zone = matchingZones[0];
+
+  const failedNs: Array<{ record: string; message: string }> = [];
+  for (const record of cfNsRecords) {
+    try {
+      const result = await dnsheClient.deleteDnsRecord(domainId, record.id ?? record.record_id ?? "");
+      if (!result?.success) failedNs.push({ record: String(record.content || record.id), message: result?.message || "删除失败" });
+    } catch (e) {
+      failedNs.push({ record: String(record.content || record.id), message: e instanceof Error ? e.message : "请求异常" });
+    }
+    await sleep(DNS_BATCH_INTERVAL);
+  }
+  if (failedNs.length > 0) {
+    return c.json(errorRes(`恢复 DNSHE 默认 NS 失败，Cloudflare zone 保留未删除：${failedNs.map((item) => `${item.record}（${item.message}）`).join("；")}`, "ns_restore_failed"), 400);
+  }
+
+  let zoneDeleted = false;
+  if (zone) {
+    try {
+      await cfClient.deleteZone(zone.id);
+      zoneDeleted = true;
+    } catch (e) {
+      await dbManager.writeLog("warning", "operation", `域名 [${domainInfo.full_domain}] 已恢复 DNSHE 默认 NS，但删除 Cloudflare zone 失败：${e instanceof Error ? e.message : "请求异常"}`);
+      return c.json(errorRes(`DNSHE 默认 NS 已恢复，但 Cloudflare zone 删除失败，请在账号 ${cfAccount.alias} 中手动确认并删除该 zone：${e instanceof Error ? e.message : "请求异常"}`, "zone_delete_failed"), 502);
+    }
+  }
+
+  // 回读真实 DNSHE 状态并更新缓存，不用本地猜测三态。
+  try {
+    const refreshed = await dnsheClient.listDnsRecords(domainId);
+    const records = refreshed.records || [];
+    await dbManager.setCache(`api_cache:dns:${domainId}`, JSON.stringify(records));
+    const dnsState = computeDnsState(records);
+    await dbManager.updateDomainStatusAndDns(domainId, dnsState.status, Number(dnsState.has_dns), dnsState.dns_provider);
+  } catch (e) {
+    console.error(`取消委派后刷新域名状态失败 [${domainId}]:`, e);
+  }
+
+  const message = zone
+    ? `域名 [${domainInfo.full_domain}] 已恢复 DNSHE 默认 NS，并删除 Cloudflare zone`
+    : `域名 [${domainInfo.full_domain}] 已恢复 DNSHE 默认 NS（未找到可确认归属的 Cloudflare zone）`;
+  await dbManager.writeLog("warning", "operation", `${message}（DNSHE 账号 ${dnsheAlias}，Cloudflare 账号 ${cfAccount.alias}）`);
+  return c.json(successRes({
+    message,
+    full_domain: domainInfo.full_domain,
+    default_nameservers: ["ns1.dnshe.com", "ns2.dnshe.com"],
+    zone_id: zone?.id || null,
+    zone_deleted: zoneDeleted,
+    ns_restored: true,
+  }));
 });
 
 // 4. 获取子域名下所有的 DNS 解析记录 (代理接口)

@@ -496,6 +496,15 @@ export class CloudflareClient {
   }
 
   /**
+   * 删除一个已确认归属的 zone。
+   * 调用方必须先按真实 Cloudflare Account ID 精确查找并校验名称；这里不接受域名，
+   * 避免把同名 zone 或其它账号的 zone 误删。
+   */
+  async deleteZone(zoneId: string | number): Promise<void> {
+    await this.request("DELETE", `/zones/${encodeURIComponent(String(zoneId))}`);
+  }
+
+  /**
    * 列出 zone 下全部 DNS 解析记录（分页拉全，映射为内部形状）
    */
   async listDnsRecords(zoneId: string | number): Promise<ListDnsRecordsResponse> {

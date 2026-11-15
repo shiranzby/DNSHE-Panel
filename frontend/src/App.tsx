@@ -1004,6 +1004,7 @@ export default function App() {
   const [nsModalDomain, setNsModalDomain] = useState<Domain | null>(null);
   const [nsRecords, setNsRecords] = useState<DnsRecord[]>([]);
   const [loadingNsModal, setLoadingNsModal] = useState(false);
+  const [undelegateCfAccountId, setUndelegateCfAccountId] = useState<string>("");
   const [newCustomNsContent, setNewCustomNsContent] = useState("");
   const [forceReplaceConflict, setForceReplaceConflict] = useState(true);
 
@@ -2029,6 +2030,18 @@ export default function App() {
                       </span>
                     )}
                   </span>
+                </button>
+              )}
+
+              {alreadyOnCloudflare && (
+                <button
+                  onClick={() => {
+                    setOpenActionMenuId(null);
+                    handleOpenNsModal(dom);
+                  }}
+                  className="w-full text-left px-3.5 py-2.5 hover:bg-rose-50 dark:hover:bg-rose-950/30 text-rose-700 dark:text-rose-300 flex items-center gap-2 border-t border-border-base"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" /> 取消委派并恢复 NS
                 </button>
               )}
               
@@ -3987,6 +4000,7 @@ export default function App() {
   const handleOpenNsModal = async (domain: Domain) => {
     setNsModalDomain(domain);
     setNsModalOpen(true);
+    setUndelegateCfAccountId(cfAccounts.length === 1 ? String(cfAccounts[0].id) : "");
     setLoadingNsModal(true);
     setNsRecords([]);
     setNewCustomNsContent("");
@@ -4134,6 +4148,32 @@ export default function App() {
   const handleResetToDefaultNs = async () => {
     if (!nsModalDomain) return;
     const isDefaultNs = checkHasDns(nsModalDomain);
+    const providerLabel = getDnsProviderLabel(nsModalDomain, nsRecords);
+    if (!isDefaultNs && providerLabel === "Cloudflare") {
+      const confirmCloudflare = `确定取消域名 [${nsModalDomain.full_domain}] 的 Cloudflare 委派吗？\n将先恢复 DNSHE 默认 NS（ns1.dnshe.com / ns2.dnshe.com），再删除所选账号下精确匹配的 Cloudflare zone。`;
+      if (!confirm(confirmCloudflare)) return;
+      setActionLoading("reset-ns");
+      try {
+        const res = await apiFetch(`/api/domains/${nsModalDomain.id}/undelegate-cloudflare`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cf_account_id: undelegateCfAccountId || undefined })
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showToast("error", data.message || "取消 Cloudflare 委派失败");
+          return;
+        }
+        showToast("success", data.message || `已恢复 DNSHE 默认 NS${data.zone_deleted ? "并删除 Cloudflare zone" : ""}`);
+        setNsModalOpen(false);
+        await handleSyncDomains();
+      } catch {
+        showToast("error", "取消 Cloudflare 委派请求发生网络异常");
+      } finally {
+        setActionLoading(null);
+      }
+      return;
+    }
     const confirmMsg = isDefaultNs
       ? `域名 [${nsModalDomain.full_domain}] 已委派回系统默认 NS，确定清理区域内残留的 ${nsRecords.length} 条 NS 解析记录吗？`
       : `确定要将域名 [${nsModalDomain.full_domain}] 恢复为系统默认 NS 吗？这会清除当前配置的第三方 NS 记录。`;
@@ -13351,6 +13391,21 @@ export default function App() {
                 );
               })()}
 
+              {!checkHasDns(nsModalDomain) && getDnsProviderLabel(nsModalDomain, nsRecords) === "Cloudflare" && cfAccounts.length > 1 && (
+                <label className="block p-3 rounded border border-border-base bg-hovered text-xs text-content-secondary">
+                  <span className="block mb-1 font-semibold text-content-primary">确认 Cloudflare 账号</span>
+                  <select
+                    value={undelegateCfAccountId}
+                    onChange={(event) => setUndelegateCfAccountId(event.target.value)}
+                    className="w-full mt-1 px-3 py-2 rounded border border-border-base bg-surface text-content-primary"
+                  >
+                    <option value="">请选择账号</option>
+                    {cfAccounts.map((account) => <option key={account.id} value={account.id}>{account.alias}</option>)}
+                  </select>
+                  <span className="block mt-1 text-[11px] text-content-muted">只会删除该账号下名称精确匹配 {nsModalDomain.full_domain} 的 zone。</span>
+                </label>
+              )}
+
               {/* 已设置的 NS 记录列表 */}
               {loadingNsModal ? (
                 <div className="flex justify-center py-6">
@@ -13389,7 +13444,9 @@ export default function App() {
                     className="w-full bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:hover:bg-emerald-900/60 dark:text-emerald-300 dark:border-emerald-900/60 py-2.5 rounded font-semibold text-xs flex items-center justify-center gap-2 transition-all shadow-inner mt-2"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${actionLoading === "reset-ns" ? "animate-spin" : ""}`} />
-                    {checkHasDns(nsModalDomain)
+                    {!checkHasDns(nsModalDomain) && getDnsProviderLabel(nsModalDomain, nsRecords) === "Cloudflare"
+                      ? "取消 Cloudflare 委派并恢复默认 NS"
+                      : checkHasDns(nsModalDomain)
                       ? `清理这 ${nsRecords.length} 条残留 NS 记录`
                       : "一键恢复为系统默认 NS (ns1.dnshe.com / ns2.dnshe.com)"}
                   </button>
